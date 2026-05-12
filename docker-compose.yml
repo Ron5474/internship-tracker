@@ -1,6 +1,6 @@
 services:
   internship-tracker:
-    image: ghcr.io/ron5474/internship-tracker:latest
+    image: YOUR_DOCKERHUB_USERNAME/internship-tracker:latest
     restart: always
     volumes:
       - ./data:/data
