@@ -3,29 +3,27 @@ import re
 
 def parse_new_rows(patch: str) -> list[dict]:
     rows = []
+    in_tr = False
+    current_block: list[str] = []
+
     for line in patch.splitlines():
-        if not line.startswith("+|"):
+        if not line.startswith("+"):
+            if in_tr:
+                in_tr = False
+                current_block = []
             continue
-        line = line[1:]  # strip leading +
-        if re.match(r"^\|\s*[-:]+\s*\|", line):
-            continue  # separator row like | --- | --- |
-        cols = [c.strip() for c in line.split("|")]
-        cols = [c for c in cols if c]  # drop empty strings from leading/trailing |
-        if len(cols) < 4:
-            continue
-        company = _extract_company(cols[0])
-        role = _strip_html(cols[1])
-        location = _strip_html(cols[2])
-        url = _extract_url(cols[3])
-        if not company or not role:
-            continue
-        # skip closed positions
-        if role.startswith("🔒"):
-            continue
-        # skip continuation rows (multiple locations for same company)
-        if company == "↳":
-            continue
-        rows.append({"company": company, "role": role, "location": location, "url": url})
+        content = line[1:]
+        if content.strip() == "<tr>":
+            in_tr = True
+            current_block = [content]
+        elif in_tr:
+            current_block.append(content)
+            if content.strip() == "</tr>":
+                row = _parse_tr_block(current_block)
+                if row:
+                    rows.append(row)
+                in_tr = False
+                current_block = []
     return rows
 
 
@@ -34,22 +32,34 @@ def filter_by_keywords(rows: list[dict], keywords: list[str]) -> list[dict]:
     return [r for r in rows if any(k in r["role"].lower() for k in lower_keywords)]
 
 
-def _extract_company(text: str) -> str:
-    match = re.search(r"\*\*\[(.+?)\]", text)
-    if match:
-        return match.group(1)
-    return re.sub(r"[*\[\]()]+", "", text).strip()
+def _parse_tr_block(tr_lines: list[str]) -> dict | None:
+    html = "\n".join(tr_lines)
+    tds = re.findall(r"<td>(.*?)</td>", html, re.DOTALL)
+    if len(tds) < 4:
+        return None
+    company = _extract_text(tds[0])
+    role = _extract_text(tds[1])
+    location = _extract_location(tds[2])
+    url = _extract_url(tds[3])
+    if not company or not role:
+        return None
+    if role.startswith("🔒"):
+        return None
+    if company == "↳":
+        return None
+    return {"company": company, "role": role, "location": location, "url": url}
 
 
-def _extract_url(text: str) -> str:
-    match = re.search(r'href="([^"]+)"', text)
-    if match:
-        return match.group(1)
-    match = re.search(r"\(([^)]+)\)", text)
-    if match:
-        return match.group(1)
-    return ""
+def _extract_text(html: str) -> str:
+    return re.sub(r"<[^>]+>", "", html).strip()
 
 
-def _strip_html(text: str) -> str:
-    return re.sub(r"<[^>]+>", "", text).strip()
+def _extract_location(html: str) -> str:
+    html = re.sub(r"<summary>.*?</summary>", "", html, flags=re.DOTALL)
+    html = re.sub(r"<br\s*/?>", ", ", html)
+    return _extract_text(html)
+
+
+def _extract_url(html: str) -> str:
+    match = re.search(r'href="([^"]+)"', html)
+    return match.group(1) if match else ""
