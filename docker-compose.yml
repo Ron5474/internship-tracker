@@ -1,6 +1,6 @@
 services:
   internship-tracker:
-    image: YOUR_DOCKERHUB_USERNAME/internship-tracker:latest
+    image: ronp2805/internship-tracker:latest
     restart: always
     volumes:
       - ./data:/data
