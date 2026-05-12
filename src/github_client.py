@@ -1,6 +1,7 @@
 import requests
 
 GITHUB_API = "https://api.github.com"
+GITHUB_RAW = "https://raw.githubusercontent.com"
 
 
 def _headers(token: str | None) -> dict:
@@ -17,11 +18,10 @@ def get_latest_sha(repo: str, branch: str, token: str | None = None) -> str:
     return resp.json()[0]["sha"]
 
 
-def get_readme_patch(repo: str, base_sha: str, head_sha: str, token: str | None = None) -> str | None:
-    url = f"{GITHUB_API}/repos/{repo}/compare/{base_sha}...{head_sha}"
-    resp = requests.get(url, headers=_headers(token), timeout=10)
+def get_readme_content(repo: str, sha: str, token: str | None = None) -> str | None:
+    url = f"{GITHUB_RAW}/{repo}/{sha}/README.md"
+    resp = requests.get(url, headers=_headers(token), timeout=30)
+    if resp.status_code == 404:
+        return None
     resp.raise_for_status()
-    for f in resp.json().get("files", []):
-        if f["filename"] == "README.md":
-            return f.get("patch")
-    return None
+    return resp.text

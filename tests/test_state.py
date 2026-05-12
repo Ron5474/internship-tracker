@@ -1,7 +1,7 @@
 import os
 import tempfile
 
-from src.state import read_last_sha, write_last_sha
+from src.state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
 
 
 def test_read_last_sha_returns_none_when_file_missing():
@@ -41,3 +41,32 @@ def test_read_last_sha_returns_none_for_empty_file():
             f.write("")
         result = read_last_sha(tmpdir)
         assert result is None
+
+
+def test_read_known_urls_returns_empty_set_when_file_missing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        result = read_known_urls(tmpdir)
+        assert result == set()
+
+
+def test_write_and_read_known_urls_roundtrip():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        urls = {"https://example.com/a", "https://example.com/b"}
+        write_known_urls(tmpdir, urls)
+        result = read_known_urls(tmpdir)
+        assert result == urls
+
+
+def test_read_known_urls_returns_set_type():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        write_known_urls(tmpdir, {"https://a.com", "https://b.com"})
+        result = read_known_urls(tmpdir)
+        assert isinstance(result, set)
+        assert len(result) == 2
+
+
+def test_write_known_urls_empty_set():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        write_known_urls(tmpdir, set())
+        result = read_known_urls(tmpdir)
+        assert result == set()

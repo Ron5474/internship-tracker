@@ -1,40 +1,52 @@
 import re
 
 
-def parse_new_rows(patch: str) -> list[dict]:
-    rows = []
-    in_tr = False
-    current_block: list[str] = []
-
-    for line in patch.splitlines():
-        if not line.startswith("+"):
-            if in_tr:
-                in_tr = False
-                current_block = []
+def parse_sections(content: str) -> dict[str, list[dict]]:
+    """Split README into {normalized_section_name: [rows]}."""
+    sections: dict[str, list[dict]] = {}
+    chunks = re.split(r"\n(?=## )", content)
+    for chunk in chunks:
+        lines = chunk.splitlines()
+        if not lines or not lines[0].startswith("## "):
             continue
-        content = line[1:]
-        if content.strip() == "<tr>":
-            in_tr = True
-            current_block = [content]
-        elif in_tr:
-            current_block.append(content)
-            if content.strip() == "</tr>":
-                row = _parse_tr_block(current_block)
-                if row:
-                    rows.append(row)
-                in_tr = False
-                current_block = []
+        name = _normalize_section(lines[0])
+        rows = _parse_table_rows("\n".join(lines[1:]))
+        sections[name] = rows
+    return sections
+
+
+def find_new_rows(
+    sections: dict[str, list[dict]],
+    known_urls: set[str],
+    target_sections: list[str],
+) -> list[dict]:
+    new_rows = []
+    for section_name, rows in sections.items():
+        if not any(t in section_name for t in target_sections):
+            continue
+        for row in rows:
+            if row["url"] not in known_urls:
+                new_rows.append(row)
+    return new_rows
+
+
+def _normalize_section(heading: str) -> str:
+    heading = re.sub(r"^##\s+", "", heading)
+    heading = re.sub(r"[^\x00-\x7F]+", "", heading)
+    return heading.lower().strip()
+
+
+def _parse_table_rows(html: str) -> list[dict]:
+    rows = []
+    for match in re.finditer(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL):
+        row = _parse_tr_block(match.group(1))
+        if row:
+            rows.append(row)
     return rows
 
 
-def filter_by_keywords(rows: list[dict], keywords: list[str]) -> list[dict]:
-    lower_keywords = [k.lower() for k in keywords]
-    return [r for r in rows if any(k in r["role"].lower() for k in lower_keywords)]
-
-
-def _parse_tr_block(tr_lines: list[str]) -> dict | None:
-    html = "\n".join(tr_lines)
-    tds = re.findall(r"<td>(.*?)</td>", html, re.DOTALL)
+def _parse_tr_block(tr_inner: str) -> dict | None:
+    tds = re.findall(r"<td>(.*?)</td>", tr_inner, re.DOTALL)
     if len(tds) < 4:
         return None
     company = _extract_text(tds[0])

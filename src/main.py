@@ -5,9 +5,9 @@ import time
 from dotenv import load_dotenv
 
 from discord_client import format_message, send_notification
-from github_client import get_latest_sha, get_readme_patch
-from parser import filter_by_keywords, parse_new_rows
-from state import read_last_sha, write_last_sha
+from github_client import get_latest_sha, get_readme_content
+from parser import find_new_rows, parse_sections
+from state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
 
 load_dotenv()
 
@@ -23,19 +23,25 @@ DATA_DIR = os.getenv("DATA_DIR", "/data")
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-FILTER_KEYWORDS = [
-    k.strip()
-    for k in os.getenv("FILTER_KEYWORDS", "software engineer,swe,ai,machine learning,ml").split(",")
+FILTER_SECTIONS = [
+    s.strip().lower()
+    for s in os.getenv("FILTER_SECTIONS", "software engineering,product management,data science").split(",")
 ]
 
 
 def poll() -> None:
     current_sha = get_latest_sha(REPO, BRANCH, GITHUB_TOKEN)
     last_sha = read_last_sha(DATA_DIR)
+    known_urls = read_known_urls(DATA_DIR)
 
-    if last_sha is None:
-        log.info("First run — recording SHA %s, no notifications sent", current_sha[:7])
+    if last_sha is None or not known_urls:
+        readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
+        if readme:
+            sections = parse_sections(readme)
+            all_urls = {r["url"] for rows in sections.values() for r in rows}
+            write_known_urls(DATA_DIR, all_urls)
         write_last_sha(DATA_DIR, current_sha)
+        log.info("Initialized state — recording SHA %s, no notifications sent", current_sha[:7])
         return
 
     if current_sha == last_sha:
@@ -43,18 +49,17 @@ def poll() -> None:
         return
 
     log.info("New commits: %s → %s", last_sha[:7], current_sha[:7])
-    patch = get_readme_patch(REPO, last_sha, current_sha, GITHUB_TOKEN)
+    readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
 
-    if patch is None:
-        log.info("README.md unchanged in this commit range")
+    if readme is None:
         write_last_sha(DATA_DIR, current_sha)
         return
 
-    rows = parse_new_rows(patch)
-    matching = filter_by_keywords(rows, FILTER_KEYWORDS)
-    log.info("New rows: %d total, %d match keywords", len(rows), len(matching))
+    sections = parse_sections(readme)
+    new_rows = find_new_rows(sections, known_urls, FILTER_SECTIONS)
+    log.info("New postings in target sections: %d", len(new_rows))
 
-    for posting in matching:
+    for posting in new_rows:
         message = format_message(posting)
         ok = send_notification(DISCORD_WEBHOOK_URL, message)
         if ok:
@@ -62,11 +67,13 @@ def poll() -> None:
         else:
             log.error("Failed to notify for %s — %s", posting["company"], posting["role"])
 
+    all_urls = {r["url"] for rows in sections.values() for r in rows}
+    write_known_urls(DATA_DIR, all_urls)
     write_last_sha(DATA_DIR, current_sha)
 
 
 def main() -> None:
-    log.info("Internship tracker started (interval: %ds, keywords: %s)", POLL_INTERVAL, FILTER_KEYWORDS)
+    log.info("Internship tracker started (interval: %ds, sections: %s)", POLL_INTERVAL, FILTER_SECTIONS)
     while True:
         try:
             poll()
