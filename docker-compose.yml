@@ -1,0 +1,8 @@
+services:
+  internship-tracker:
+    image: ghcr.io/ron5474/internship-tracker:latest
+    restart: always
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env

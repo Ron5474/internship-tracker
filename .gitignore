@@ -1,0 +1,5 @@
+.env
+data/last_sha.txt
+__pycache__/
+*.pyc
+.pytest_cache/
