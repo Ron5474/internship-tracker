@@ -32,7 +32,7 @@ FILTER_SECTIONS = [
 def poll() -> None:
     current_sha = get_latest_sha(REPO, BRANCH, GITHUB_TOKEN)
     last_sha = read_last_sha(DATA_DIR)
-    known_urls = read_known_urls(DATA_DIR)
+    known_urls = {url_key(u) for u in read_known_urls(DATA_DIR)}
 
     if last_sha is None or not known_urls:
         readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
