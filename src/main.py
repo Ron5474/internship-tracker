@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 
 from discord_client import format_message, send_notification
 from github_client import get_latest_sha, get_readme_content
-from parser import find_new_rows, parse_sections
+from parser import find_new_rows, parse_sections, url_key
 from state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
 
 load_dotenv()
@@ -38,7 +38,7 @@ def poll() -> None:
         readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
         if readme:
             sections = parse_sections(readme)
-            all_urls = {r["url"] for rows in sections.values() for r in rows}
+            all_urls = {url_key(r["url"]) for rows in sections.values() for r in rows}
             write_known_urls(DATA_DIR, all_urls)
         write_last_sha(DATA_DIR, current_sha)
         log.info("Initialized state — recording SHA %s, no notifications sent", current_sha[:7])
@@ -67,7 +67,7 @@ def poll() -> None:
         else:
             log.error("Failed to notify for %s — %s", posting["company"], posting["role"])
 
-    all_urls = {r["url"] for rows in sections.values() for r in rows}
+    all_urls = {url_key(r["url"]) for rows in sections.values() for r in rows}
     write_known_urls(DATA_DIR, all_urls)
     write_last_sha(DATA_DIR, current_sha)
 

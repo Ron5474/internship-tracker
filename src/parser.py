@@ -1,4 +1,11 @@
 import re
+from urllib.parse import urlparse, urlunparse
+
+
+def url_key(url: str) -> str:
+    """Strip query string and fragment for stable deduplication."""
+    p = urlparse(url)
+    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
 
 
 def parse_sections(content: str) -> dict[str, list[dict]]:
@@ -25,7 +32,7 @@ def find_new_rows(
         if not any(t in section_name for t in target_sections):
             continue
         for row in rows:
-            if row["url"] not in known_urls:
+            if url_key(row["url"]) not in known_urls:
                 new_rows.append(row)
     return new_rows
 

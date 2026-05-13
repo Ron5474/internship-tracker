@@ -1,4 +1,4 @@
-from src.parser import find_new_rows, parse_sections
+from src.parser import find_new_rows, parse_sections, url_key
 
 _SWE_TABLE = """\
 <table>
@@ -194,6 +194,22 @@ def test_find_new_rows_empty_sections_returns_empty():
 
 def test_find_new_rows_all_known_returns_empty():
     sections = parse_sections(SAMPLE_README)
-    all_urls = {r["url"] for rows in sections.values() for r in rows}
+    all_urls = {url_key(r["url"]) for rows in sections.values() for r in rows}
     rows = find_new_rows(sections, all_urls, _TARGET)
     assert rows == []
+
+
+def test_find_new_rows_ignores_utm_param_changes():
+    # Simulate SimplifyJobs adding utm_source to an existing URL — should not re-notify
+    sections = parse_sections(SAMPLE_README)
+    # Store the bare URL (no query string) as if initialized before utm params were added
+    known = {"https://stripe.com/jobs/123"}
+    rows = find_new_rows(sections, known, _TARGET)
+    companies = {r["company"] for r in rows}
+    assert "Stripe" not in companies
+
+
+def test_url_key_strips_query_and_fragment():
+    assert url_key("https://example.com/job?utm_source=Simplify&ref=x") == "https://example.com/job"
+    assert url_key("https://example.com/job#section") == "https://example.com/job"
+    assert url_key("https://example.com/job") == "https://example.com/job"
