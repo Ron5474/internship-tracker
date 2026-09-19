@@ -1,3 +1,4 @@
+from collections.abc import Iterable
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -13,8 +14,11 @@ from sqlalchemy import (
     event,
 )
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 from sqlalchemy.pool import StaticPool
+
+from config import FeedSpec
+from state import read_known_urls, read_last_sha
 
 STAGE_DELIVER = "deliver"
 STAGE_CLOSED = "closed"
@@ -131,3 +135,34 @@ def init_db(engine: Engine) -> None:
 
 def make_session_factory(engine: Engine) -> sessionmaker:
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def ensure_feeds(session: Session, feeds: Iterable[FeedSpec]) -> None:
+    existing = {f.name for f in session.query(Feed).all()}
+    for spec in feeds:
+        if spec.name not in existing:
+            session.add(Feed(name=spec.name, repo=spec.repo, branch=spec.branch))
+    session.flush()
+
+
+def import_legacy_state(session: Session, data_dir: str) -> int:
+    """One-time import of the pre-pipeline known_urls.json / last_sha.txt.
+
+    Runs only while the jobs table is empty. Seeds every known URL as an
+    already-seen internships job (no evaluations, so nothing is notified) and
+    carries the SHA over so the next poll diffs from where the old tracker left off.
+    """
+    if session.query(Job.id).first() is not None:
+        return 0
+    known = read_known_urls(data_dir)
+    if not known:
+        return 0
+    feed = session.query(Feed).filter_by(name="internships").one()
+    for key in sorted(known):
+        session.add(Job(
+            feed=feed, url_key=key, url=key, company="", role="", location="",
+            section="", fetch_status=FETCH_OK,
+        ))
+    feed.last_sha = read_last_sha(data_dir)
+    session.flush()
+    return len(known)
