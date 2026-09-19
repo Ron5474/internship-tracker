@@ -6,6 +6,7 @@ from dotenv import load_dotenv
 
 from discord_client import format_message, send_notification
 from github_client import get_latest_sha, get_readme_content
+from migration import migrate_state
 from parser import find_new_rows, parse_sections, url_key
 from state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
 
@@ -74,9 +75,14 @@ def poll() -> None:
 
 def main() -> None:
     log.info("Internship tracker started (interval: %ds, sections: %s)", POLL_INTERVAL, FILTER_SECTIONS)
+    migrated = False
     while True:
         try:
-            poll()
+            # Never poll against pre-migration state: the old keys would make every job look new.
+            if not migrated:
+                migrated = migrate_state(DATA_DIR, lambda sha: get_readme_content(REPO, sha, GITHUB_TOKEN))
+            if migrated:
+                poll()
         except Exception as e:
             log.error("Poll error: %s", e)
         time.sleep(POLL_INTERVAL)

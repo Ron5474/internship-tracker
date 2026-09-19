@@ -1,11 +1,23 @@
 import re
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+_TRACKING_PARAMS = {"ref"}
+
+
+def _is_tracking_param(name: str) -> bool:
+    return name.startswith("utm_") or name in _TRACKING_PARAMS
 
 
 def url_key(url: str) -> str:
-    """Strip query string and fragment for stable deduplication."""
+    """Normalize a URL for deduplication.
+
+    Drops tracking params (utm_*, ref) and the fragment, but keeps every other
+    query param — some boards (e.g. Greenhouse embeds) identify the posting only
+    via ``?gh_jid=``. Remaining params are sorted so key order is stable.
+    """
     p = urlparse(url)
-    return urlunparse((p.scheme, p.netloc, p.path, "", "", ""))
+    params = sorted((k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if not _is_tracking_param(k))
+    return urlunparse((p.scheme, p.netloc, p.path, "", urlencode(params), ""))
 
 
 def parse_sections(content: str) -> dict[str, list[dict]]:
@@ -43,16 +55,30 @@ def _normalize_section(heading: str) -> str:
     return heading.lower().strip()
 
 
+_CONTINUATION = "↳"
+
+
 def _parse_table_rows(html: str) -> list[dict]:
+    """Parse every <tr> in a section's table.
+
+    Rows whose company cell is ``↳`` are additional postings at the company of
+    the closest preceding row — that row may itself be closed, so the company
+    is tracked before any filtering. Inheritance is per section: a ``↳`` row
+    with nothing above it is dropped.
+    """
     rows = []
+    last_company: str | None = None
     for match in re.finditer(r"<tr[^>]*>(.*?)</tr>", html, re.DOTALL):
-        row = _parse_tr_block(match.group(1))
-        if row:
+        row = _parse_tr_block(match.group(1), last_company)
+        if row is None:
+            continue
+        last_company = row["company"]
+        if not row.pop("closed"):
             rows.append(row)
     return rows
 
 
-def _parse_tr_block(tr_inner: str) -> dict | None:
+def _parse_tr_block(tr_inner: str, last_company: str | None) -> dict | None:
     tds = re.findall(r"<td>(.*?)</td>", tr_inner, re.DOTALL)
     if len(tds) < 4:
         return None
@@ -60,13 +86,18 @@ def _parse_tr_block(tr_inner: str) -> dict | None:
     role = _extract_text(tds[1])
     location = _extract_location(tds[2])
     url = _extract_url(tds[3])
+    if company == _CONTINUATION:
+        company = last_company
     if not company or not role:
         return None
-    if role.startswith("🔒"):
-        return None
-    if company == "↳":
-        return None
-    return {"company": company, "role": role, "location": location, "url": url}
+    return {
+        "company": company,
+        "role": role,
+        "location": location,
+        "url": url,
+        # Internships feed locks the role text; New-Grad feed locks the Application cell (no link).
+        "closed": role.startswith("🔒") or not url,
+    }
 
 
 def _extract_text(html: str) -> str:
