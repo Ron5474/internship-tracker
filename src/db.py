@@ -7,6 +7,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    MetaData,
     String,
     Text,
     UniqueConstraint,
@@ -172,7 +173,7 @@ def import_legacy_state(session: Session, data_dir: str) -> int:
     return len(known)
 
 
-def ensure_columns(engine: Engine) -> list[str]:
+def ensure_columns(engine: Engine, metadata: MetaData = Base.metadata) -> list[str]:
     """Add columns that exist in the models but not in an existing database.
 
     create_all() only creates missing tables. Each plan that adds a column
@@ -181,11 +182,15 @@ def ensure_columns(engine: Engine) -> list[str]:
     """
     added: list[str] = []
     inspector = inspect(engine)
-    for table in Base.metadata.sorted_tables:
+    for table in metadata.sorted_tables:
         existing = {c["name"] for c in inspector.get_columns(table.name)}
         for column in table.columns:
             if column.name in existing:
                 continue
+            if not column.nullable:
+                raise RuntimeError(
+                    f"ensure_columns can only add nullable columns; {table.name}.{column.name} is NOT NULL"
+                )
             ddl = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column.type.compile(engine.dialect)}"
             with engine.begin() as conn:
                 conn.execute(text(ddl))

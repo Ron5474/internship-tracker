@@ -2,8 +2,9 @@ import tempfile
 from datetime import datetime
 
 import pytest
-from sqlalchemy import inspect, text
+from sqlalchemy import Column, Integer, MetaData, String, inspect, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import DeclarativeBase
 
 from config import FEEDS
 from db import (
@@ -16,6 +17,8 @@ from db import (
     ensure_columns,
     ensure_feeds,
     import_legacy_state,
+    init_db,
+    make_engine,
     utcnow,
 )
 from state import write_known_urls, write_last_sha
@@ -159,7 +162,6 @@ def test_job_has_fetch_strategy_and_has_requirements(session):
 
 
 def test_ensure_columns_adds_missing_columns_to_existing_db(tmp_path):
-    from db import init_db, make_engine
     engine = make_engine(str(tmp_path / "old.db"))
     init_db(engine)
     # Simulate a database created before this plan: drop the two new columns.
@@ -176,7 +178,25 @@ def test_ensure_columns_adds_missing_columns_to_existing_db(tmp_path):
 
 
 def test_ensure_columns_is_noop_when_current(tmp_path):
-    from db import init_db, make_engine
     engine = make_engine(str(tmp_path / "new.db"))
     init_db(engine)
     assert ensure_columns(engine) == []
+
+
+def test_ensure_columns_refuses_non_nullable_column(tmp_path):
+    class ProbeBase(DeclarativeBase):
+        pass
+
+    class Probe(ProbeBase):
+        __tablename__ = "probe"
+        id: int = Column(Integer, primary_key=True)
+        must: str = Column(String, nullable=False)
+
+    # Create a database with only the id column (simulating pre-plan schema).
+    engine = make_engine(str(tmp_path / "probe.db"))
+    with engine.begin() as conn:
+        conn.execute(text("CREATE TABLE probe (id INTEGER PRIMARY KEY)"))
+
+    # Attempt to ensure the non-nullable column exists should raise.
+    with pytest.raises(RuntimeError, match="nullable"):
+        ensure_columns(engine, metadata=ProbeBase.metadata)
