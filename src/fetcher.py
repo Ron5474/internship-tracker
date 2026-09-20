@@ -43,9 +43,11 @@ _REQUIREMENTS = re.compile(
 )
 
 
-def html_to_text(html: str) -> str:
+def html_to_text(html: str | None) -> str:
     """Rough HTML → plain text: entities unescaped (twice — Greenhouse double-escapes),
     block closers and <br> become newlines, tags dropped, whitespace normalised."""
+    if not html:
+        return ""
     # Unescape twice: Greenhouse returns HTML that is itself entity-escaped, and a
     # second pass over already-plain text is a no-op.
     s = html_lib.unescape(html_lib.unescape(html))

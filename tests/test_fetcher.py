@@ -33,6 +33,11 @@ def test_html_to_text_handles_double_escaped_greenhouse_content():
     assert html_to_text("&lt;p&gt;Role &amp;amp; team&lt;/p&gt;") == "Role & team"
 
 
+def test_html_to_text_none_is_empty():
+    assert html_to_text(None) == ""
+    assert html_to_text("") == ""
+
+
 # --- has_requirements --------------------------------------------------------
 
 def test_has_requirements_true_on_common_headings():
@@ -215,3 +220,21 @@ def test_api_calls_use_timeout_and_user_agent():
         fetch_via_api("greenhouse", {"board": "b", "job_id": "1"})
     assert get.call_args.kwargs["timeout"] == 15
     assert "Mozilla" in get.call_args.kwargs["headers"]["User-Agent"]
+
+
+def test_lever_handler_tolerates_null_list_content():
+    body = {
+        "descriptionPlain": LONG,
+        "lists": [{"text": "Perks", "content": None}],
+        "additionalPlain": None,
+    }
+    with patch("fetcher.requests.get", return_value=_resp(200, body)):
+        r = fetch_via_api("lever", {"company": "x", "uuid": "0" * 8 + "-0000-0000-0000-" + "0" * 12})
+    assert r.ok and "Perks" in r.text
+
+
+def test_workday_handler_null_description_is_permanent_too_short():
+    body = {"jobPostingInfo": {"jobDescription": None}}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)):
+        r = fetch_via_api("workday", {"tenant": "t", "wd": "wd1", "site": "s", "path": "p"})
+    assert r.kind == "permanent" and "too short" in r.error
