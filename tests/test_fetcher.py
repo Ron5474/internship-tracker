@@ -6,6 +6,7 @@ from fetcher import (
     MIN_DESCRIPTION_CHARS,
     FetchResult,
     classify_status,
+    fetch_description,
     fetch_via_api,
     has_requirements,
     html_to_text,
@@ -38,6 +39,12 @@ def test_html_to_text_none_is_empty():
     assert html_to_text("") == ""
 
 
+def test_html_to_text_separates_table_cells():
+    assert html_to_text(
+        "<table><tr><th>Level</th><th>Pay</th></tr><tr><td>L3</td><td>$100k</td></tr></table>"
+    ) == "Level\nPay\nL3\n$100k"
+
+
 # --- has_requirements --------------------------------------------------------
 
 def test_has_requirements_true_on_common_headings():
@@ -67,6 +74,11 @@ def test_match_lever_with_and_without_apply_suffix():
 def test_match_ashby():
     u = "https://jobs.ashbyhq.com/meow/56e3b840-11a0-4e98-baca-44e8e26b5218/application?embed=true"
     assert match_ats(u) == ("ashby", {"company": "meow", "uuid": "56e3b840-11a0-4e98-baca-44e8e26b5218"})
+
+
+def test_match_lever_accepts_uppercase_uuid():
+    assert match_ats("https://jobs.lever.co/acme/718B3135-D15D-4CBC-9541-1CBB8A6F5EC5") == (
+        "lever", {"company": "acme", "uuid": "718B3135-D15D-4CBC-9541-1CBB8A6F5EC5"})
 
 
 def test_match_smartrecruiters():
@@ -238,3 +250,86 @@ def test_workday_handler_null_description_is_permanent_too_short():
     with patch("fetcher.requests.get", return_value=_resp(200, body)):
         r = fetch_via_api("workday", {"tenant": "t", "wd": "wd1", "site": "s", "path": "p"})
     assert r.kind == "permanent" and "too short" in r.error
+
+
+# --- fetch_description ---------------------------------------------------------
+
+PAGE_HTML = "<html><body><main><h1>Software Engineer</h1><h2>Qualifications</h2><p>" + LONG + "</p></main></body></html>"
+
+
+def _page(status=200, text=PAGE_HTML, url="https://careers.example.com/job/1"):
+    r = _resp(status, None, text)
+    r.url = url
+    return r
+
+
+def test_fetch_description_uses_api_handler_without_fetching_page():
+    with patch("fetcher.requests.get", return_value=_resp(200, {"content": LONG})) as get:
+        r = fetch_description("https://job-boards.greenhouse.io/togetherai/jobs/5211582007?utm_source=Simplify")
+    assert r.ok and r.strategy == "greenhouse"
+    assert get.call_count == 1
+    assert "boards-api.greenhouse.io" in get.call_args.args[0]
+
+
+def test_fetch_description_falls_back_to_trafilatura_for_unknown_host():
+    with patch("fetcher.requests.get", return_value=_page()) as get, \
+         patch("fetcher.trafilatura.extract", return_value="Qualifications\n" + LONG) as extract:
+        r = fetch_description("https://careers.example.com/job/1?utm_source=Simplify")
+    assert r.ok and r.strategy == "page" and r.host == "careers.example.com"
+    assert get.call_args.kwargs["allow_redirects"] is True
+    assert get.call_args.kwargs["timeout"] == 15
+    extract.assert_called_once()
+
+
+def test_fetch_description_short_page_text_is_permanent():
+    with patch("fetcher.requests.get", return_value=_page()), \
+         patch("fetcher.trafilatura.extract", return_value="Apply now."):
+        r = fetch_description("https://careers.example.com/job/1")
+    assert r.kind == "permanent" and r.strategy == "page" and "too short" in r.error
+
+
+def test_fetch_description_none_from_trafilatura_is_permanent():
+    with patch("fetcher.requests.get", return_value=_page()), \
+         patch("fetcher.trafilatura.extract", return_value=None):
+        r = fetch_description("https://careers.example.com/job/1")
+    assert r.kind == "permanent" and r.strategy == "page"
+
+
+def test_fetch_description_page_403_is_permanent_strategy_none():
+    with patch("fetcher.requests.get", return_value=_page(403, "")):
+        r = fetch_description("https://careers.example.com/job/1")
+    assert r.kind == "permanent" and r.strategy == "none" and "403" in r.error
+
+
+def test_fetch_description_page_timeout_is_transient():
+    with patch("fetcher.requests.get", side_effect=requests.ConnectionError("dns")):
+        r = fetch_description("https://careers.example.com/job/1")
+    assert r.kind == "transient" and r.strategy == "none" and r.host == "careers.example.com"
+
+
+def test_fetch_description_redirect_to_ats_uses_handler():
+    # A wrapper URL redirects to Lever; the page GET reveals the final URL, then the API is used.
+    page = _page(url="https://jobs.lever.co/acme/718b3135-d15d-4cbc-9541-1cbb8a6f5ec5")
+    api = _resp(200, {"descriptionPlain": LONG, "lists": []})
+    with patch("fetcher.requests.get", side_effect=[page, api]) as get:
+        r = fetch_description("https://apply.acme.com/go/123")
+    assert r.ok and r.strategy == "lever"
+    assert get.call_count == 2
+
+
+def test_fetch_description_greenhouse_embed_discovers_board_from_page():
+    html = '<html><script src="https://boards.greenhouse.io/embed/job_board/js?for=stripe"></script></html>'
+    page = _page(text=html, url="https://stripe.com/jobs/search?gh_jid=8212508")
+    api = _resp(200, {"content": "&lt;p&gt;" + LONG + "&lt;/p&gt;"})
+    with patch("fetcher.requests.get", side_effect=[page, api]) as get:
+        r = fetch_description("https://stripe.com/jobs/search?gh_jid=8212508&utm_source=Simplify")
+    assert r.ok and r.strategy == "greenhouse-embed"
+    assert get.call_args.args[0] == "https://boards-api.greenhouse.io/v1/boards/stripe/jobs/8212508"
+
+
+def test_fetch_description_greenhouse_embed_without_board_falls_back_to_page():
+    page = _page(text=PAGE_HTML, url="https://stripe.com/jobs/search?gh_jid=8212508")
+    with patch("fetcher.requests.get", return_value=page), \
+         patch("fetcher.trafilatura.extract", return_value="Qualifications\n" + LONG):
+        r = fetch_description("https://stripe.com/jobs/search?gh_jid=8212508")
+    assert r.ok and r.strategy == "page"

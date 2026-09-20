@@ -34,7 +34,7 @@ class FetchResult:
 
 # --- text helpers ------------------------------------------------------------
 
-_BLOCK_CLOSE = re.compile(r"</(p|div|li|h[1-6]|tr|ul|ol|section|article|blockquote)\s*>|<br\s*/?>", re.I)
+_BLOCK_CLOSE = re.compile(r"</(p|div|li|h[1-6]|tr|td|th|ul|ol|section|article|blockquote)\s*>|<br\s*/?>", re.I)
 _TAG = re.compile(r"<[^>]+>")
 _REQUIREMENTS = re.compile(
     r"\b(requirements?|qualifications?|what you.ll need|what we.re looking for|must[- ]haves?|minimum"
@@ -71,7 +71,7 @@ def classify_status(status: int) -> str:
 
 # --- URL matching ------------------------------------------------------------
 
-_UUID = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _PATTERNS = [
     ("greenhouse", re.compile(r"^https?://(?:job-)?boards\.greenhouse\.io/(?P<board>[^/?#]+)/jobs/(?P<job_id>\d+)")),
     ("lever", re.compile(rf"^https?://jobs\.lever\.co/(?P<company>[^/?#]+)/(?P<uuid>{_UUID})")),
@@ -180,3 +180,41 @@ _HANDLERS = {
 
 def fetch_via_api(name: str, params: dict) -> FetchResult:
     return _HANDLERS[name](params)
+
+
+# --- orchestration -----------------------------------------------------------
+
+_GH_EMBED_BOARD = re.compile(r"greenhouse\.io/embed/(?:job_board|job_app)[^\"']*?[?&]for=([A-Za-z0-9_-]+)")
+_GH_JID = re.compile(r"[?&]gh_jid=(\d+)")
+
+
+def fetch_description(url: str) -> FetchResult:
+    """Apply URL → description text. API handlers first, page extraction last."""
+    matched = match_ats(url)
+    if matched:
+        return fetch_via_api(*matched)
+
+    host = urlparse(url).netloc
+    try:
+        resp = requests.get(url, headers=_HEADERS_HTML, timeout=FETCH_TIMEOUT, allow_redirects=True)
+    except requests.RequestException as e:
+        return FetchResult(None, host, "none", "transient", f"{type(e).__name__}: {e}")
+    kind = classify_status(resp.status_code)
+    if kind != "ok":
+        return FetchResult(None, host, "none", kind, f"HTTP {resp.status_code}")
+
+    final_url = resp.url or url
+    final_host = urlparse(final_url).netloc or host
+    matched = match_ats(final_url)
+    if matched:
+        return fetch_via_api(*matched)
+
+    jid = _GH_JID.search(final_url) or _GH_JID.search(url)
+    board = _GH_EMBED_BOARD.search(resp.text or "")
+    if jid and board:
+        return _greenhouse(board.group(1), jid.group(1), strategy="greenhouse-embed")
+
+    extracted = trafilatura.extract(resp.text or "", include_comments=False, include_tables=True)
+    if not extracted:
+        return FetchResult(None, final_host, "page", "permanent", "no extractable text")
+    return _finish(extracted, final_host, "page")
