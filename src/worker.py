@@ -5,14 +5,18 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from db import STAGE_CLOSED, STAGE_DELIVER, Evaluation, utcnow
+from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Job, utcnow
 from discord_client import DeliveryResult, format_link_only, send_message
+from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from users import User
 
 log = logging.getLogger(__name__)
 
 BACKOFF_SECONDS = (30, 60, 300, 900, 3600)
 DELIVERY_BUDGET = 10
+FETCH_BUDGET = 5
+FETCH_MAX_AGE_HOURS = 24
+FETCH_GAP_SECONDS = 2
 
 _LINK_ONLY_NOTES = {
     "fetch_failed": "couldn't read the description",
@@ -36,12 +40,15 @@ class Worker:
         session_factory: sessionmaker,
         users: list[User],
         send: Callable[..., DeliveryResult] = send_message,
+        fetch: Callable[[str], FetchResult] = fetch_description,
         now: Callable[[], datetime] = utcnow,
     ) -> None:
         self._sessions = session_factory
         self._users = {u.id: u for u in users}
         self._send = send
+        self._fetch = fetch
         self._now = now
+        self._fetch_not_before: datetime | None = None
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -80,6 +87,11 @@ class Worker:
 
     def run_once(self) -> bool:
         with self._sessions() as session:
+            job = self._next_fetchable(session)
+            if job is not None:
+                self.fetch(session, job)
+                session.commit()
+                return True
             ev = self._next_deliverable(session)
             if ev is None:
                 return False
@@ -87,11 +99,28 @@ class Worker:
             session.commit()
             return True
 
+    def _next_fetchable(self, session: Session) -> Job | None:
+        now = self._now()
+        if self._fetch_not_before is not None and now < self._fetch_not_before:
+            return None
+        waiting = session.query(Evaluation.job_id).filter(Evaluation.stage != STAGE_CLOSED)
+        return (
+            session.query(Job)
+            .filter(Job.fetch_status == FETCH_PENDING, Job.next_attempt_at <= now, Job.id.in_(waiting))
+            .order_by(Job.next_attempt_at, Job.id)
+            .first()
+        )
+
     def _next_deliverable(self, session: Session) -> Evaluation | None:
         now = self._now()
         candidates = (
             session.query(Evaluation)
-            .filter(Evaluation.stage == STAGE_DELIVER, Evaluation.next_attempt_at <= now)
+            .join(Job)
+            .filter(
+                Evaluation.stage == STAGE_DELIVER,
+                Evaluation.next_attempt_at <= now,
+                Job.fetch_status != FETCH_PENDING,
+            )
             .order_by(Evaluation.next_attempt_at, Evaluation.id)
             .all()
         )
@@ -99,6 +128,53 @@ class Worker:
             if not self.is_paused(f"discord:{ev.user_id}"):
                 return ev
         return None
+
+    # -- fetch stage --------------------------------------------------------
+
+    def fetch(self, session: Session, job: Job) -> None:
+        now = self._now()
+        if job.fetch_first_attempt_at is None:
+            job.fetch_first_attempt_at = now
+        job.fetch_attempts += 1
+        try:
+            result = self._fetch(job.url)
+        except Exception as e:  # noqa: BLE001 — a fetcher bug is a failed attempt, not a dead worker
+            log.exception("Fetcher raised for job %d", job.id)
+            result = FetchResult(None, job.fetch_host or "", "none", "transient", f"{type(e).__name__}: {e}")
+        self._fetch_not_before = self._now() + timedelta(seconds=FETCH_GAP_SECONDS)
+
+        job.fetch_host = result.host
+        job.fetch_strategy = result.strategy
+        chars = len(result.text or "")
+        reqs = has_requirements(result.text) if result.text else False
+        log.info("fetch job=%d host=%s strategy=%s outcome=%s chars=%d requirements=%s%s",
+                 job.id, result.host, result.strategy, result.kind, chars, "yes" if reqs else "no",
+                 f" error={result.error}" if result.error else "")
+
+        if result.ok:
+            job.description = result.text
+            job.description_truncated = chars > DESCRIPTION_CAP
+            job.has_requirements = reqs
+            job.fetch_status = FETCH_OK
+            job.fetch_error = None
+            return
+
+        job.fetch_error = result.error
+        age = now - job.fetch_first_attempt_at
+        over_budget = job.fetch_attempts >= FETCH_BUDGET or age >= timedelta(hours=FETCH_MAX_AGE_HOURS)
+        if result.kind == "permanent" or over_budget:
+            if result.kind != "permanent":
+                job.fetch_error = f"budget exhausted after {job.fetch_attempts} attempts: {result.error}"
+            self._fail_fetch(session, job)
+            return
+        job.next_attempt_at = now + timedelta(seconds=backoff(job.fetch_attempts))
+
+    def _fail_fetch(self, session: Session, job: Job) -> None:
+        job.fetch_status = FETCH_FAILED
+        for ev in job.evaluations:
+            if ev.stage != STAGE_CLOSED and ev.outcome is None:
+                ev.outcome = "fetch_failed"
+        log.warning("Job %d (%s — %s) description unavailable: %s", job.id, job.company, job.role, job.fetch_error)
 
     # -- deliver stage ------------------------------------------------------
 

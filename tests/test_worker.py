@@ -2,10 +2,20 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from db import STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
+from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
 from discord_client import DeliveryResult
+from fetcher import FetchResult
 from users import User
-from worker import BACKOFF_SECONDS, DELIVERY_BUDGET, Worker, backoff, message_for
+from worker import (
+    BACKOFF_SECONDS,
+    DELIVERY_BUDGET,
+    FETCH_BUDGET,
+    FETCH_GAP_SECONDS,
+    FETCH_MAX_AGE_HOURS,
+    Worker,
+    backoff,
+    message_for,
+)
 
 T0 = datetime(2026, 9, 19, 12, 0, 0)
 
@@ -29,10 +39,17 @@ OK = DeliveryResult("ok", None, None)
 def _seed(session, user_id="ron", **ev_kwargs):
     feed = session.query(Feed).filter_by(name="internships").first() or Feed(name="internships", repo="a/b", branch="dev")
     job = Job(feed=feed, url_key=f"https://x.com/{user_id}", url=f"https://x.com/{user_id}?utm_source=S",
-              company="Stripe", role="SWE Intern", location="SF", section="software engineering internship roles")
+              company="Stripe", role="SWE Intern", location="SF", section="software engineering internship roles",
+              next_attempt_at=T0)
     # Pin next_attempt_at to the fake clock; the model default is the real utcnow().
     ev = Evaluation(job=job, user_id=user_id, **{"next_attempt_at": T0, **ev_kwargs})
     session.add_all([feed, job, ev])
+    session.commit()
+    return ev
+
+
+def _resolve(session, ev):
+    ev.job.fetch_status = FETCH_OK
     session.commit()
     return ev
 
@@ -70,7 +87,7 @@ def test_message_for_fetch_failed_adds_note(session):
 # --- deliver ---------------------------------------------------------------
 
 def test_run_once_delivers_and_closes(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     sender = FakeSender(OK)
     w = _worker(session_factory, sender, clock)
     assert w.run_once() is True
@@ -88,7 +105,7 @@ def test_run_once_returns_false_when_idle(session_factory, session, clock):
 
 
 def test_transient_failure_schedules_retry_with_backoff(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     w = _worker(session_factory, FakeSender(DeliveryResult("transient", None, "503")), clock)
     w.run_once()
     session.refresh(ev)
@@ -99,7 +116,7 @@ def test_transient_failure_schedules_retry_with_backoff(session_factory, session
 
 
 def test_retry_after_overrides_backoff(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     w = _worker(session_factory, FakeSender(DeliveryResult("transient", 7.0, "rate limited")), clock)
     w.run_once()
     session.refresh(ev)
@@ -107,7 +124,7 @@ def test_retry_after_overrides_backoff(session_factory, session, clock):
 
 
 def test_row_not_picked_before_next_attempt_at(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     sender = FakeSender(DeliveryResult("transient", None, "503"), OK)
     w = _worker(session_factory, sender, clock)
     w.run_once()
@@ -120,7 +137,7 @@ def test_row_not_picked_before_next_attempt_at(session_factory, session, clock):
 
 
 def test_gone_webhook_pauses_user_and_leaves_row_untouched(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     w = _worker(session_factory, FakeSender(DeliveryResult("gone", None, "404")), clock)
     w.run_once()
     session.refresh(ev)
@@ -131,9 +148,9 @@ def test_gone_webhook_pauses_user_and_leaves_row_untouched(session_factory, sess
 
 
 def test_paused_user_blocks_all_their_rows_but_not_others(session_factory, session, clock):
-    _seed(session, "ron")
+    _resolve(session, _seed(session, "ron"))
     ron2 = _seed_second_ron(session)
-    cousin_ev = _seed(session, "cousin")
+    cousin_ev = _resolve(session, _seed(session, "cousin"))
     sender = FakeSender(DeliveryResult("gone", None, "404"), OK, OK)
     w = _worker(session_factory, sender, clock)
     w.run_once()                       # ron #1 → gone → paused
@@ -148,15 +165,16 @@ def test_paused_user_blocks_all_their_rows_but_not_others(session_factory, sessi
 def _seed_second_ron(session):
     feed = session.query(Feed).filter_by(name="internships").one()
     job = Job(feed=feed, url_key="https://x.com/ron2", url="https://x.com/ron2", company="Meta",
-              role="SWE Intern", location="MP", section="software engineering internship roles")
+              role="SWE Intern", location="MP", section="software engineering internship roles",
+              next_attempt_at=T0)
     ev = Evaluation(job=job, user_id="ron", next_attempt_at=T0)
     session.add_all([job, ev]); session.commit()
-    return ev
+    return _resolve(session, ev)
 
 
 def test_transient_failure_pauses_user_until_retry_time(session_factory, session, clock):
     # While one row backs off, the same user's other rows must not be attempted either.
-    ev1 = _seed(session, "ron")
+    ev1 = _resolve(session, _seed(session, "ron"))
     ev2 = _seed_second_ron(session)
     sender = FakeSender(DeliveryResult("transient", None, "503"), OK, OK)
     w = _worker(session_factory, sender, clock)
@@ -179,7 +197,7 @@ def test_transient_failure_pauses_user_until_retry_time(session_factory, session
 
 
 def test_invalid_result_does_not_pause_user(session_factory, session, clock):
-    _seed(session)
+    _resolve(session, _seed(session))
     w = _worker(session_factory, FakeSender(DeliveryResult("invalid", None, "HTTP 400: bad")), clock)
     w.run_once()
     assert "discord:ron" not in w.paused
@@ -187,7 +205,7 @@ def test_invalid_result_does_not_pause_user(session_factory, session, clock):
 
 def test_sender_exception_counts_as_transient_attempt(session_factory, session, clock):
     # e.g. the PDF vanished from disk: a failed attempt with backoff, not a worker crash.
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
 
     def boom(webhook, content, pdf_path=None):
         raise OSError("no such file")
@@ -202,7 +220,7 @@ def test_sender_exception_counts_as_transient_attempt(session_factory, session, 
 
 
 def test_invalid_request_counts_attempt_and_backs_off(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     w = _worker(session_factory, FakeSender(DeliveryResult("invalid", None, "HTTP 400: bad")), clock)
     w.run_once()
     session.refresh(ev)
@@ -212,7 +230,7 @@ def test_invalid_request_counts_attempt_and_backs_off(session_factory, session, 
 
 
 def test_after_budget_keeps_retrying_hourly(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     fails = [DeliveryResult("transient", None, "503")] * (DELIVERY_BUDGET + 1)
     w = _worker(session_factory, FakeSender(*fails), clock)
     for _ in range(DELIVERY_BUDGET + 1):
@@ -229,7 +247,7 @@ def test_after_budget_keeps_retrying_hourly(session_factory, session, clock):
 def test_unknown_user_pauses_destination_and_keeps_row(session_factory, session, clock):
     # A row for a user no longer in users.yaml waits for a fixed users.yaml + restart;
     # closed is reserved for confirmed sends and below-threshold scores.
-    ev = _seed(session, "ghost")
+    ev = _resolve(session, _seed(session, "ghost"))
     sender = FakeSender()
     w = _worker(session_factory, sender, clock)
     w.run_once()
@@ -241,13 +259,13 @@ def test_unknown_user_pauses_destination_and_keeps_row(session_factory, session,
 
 
 def test_closed_rows_are_never_picked(session_factory, session, clock):
-    _seed(session, stage=STAGE_CLOSED)
+    _resolve(session, _seed(session, stage=STAGE_CLOSED))
     w = _worker(session_factory, FakeSender(), clock)
     assert w.run_once() is False
 
 
 def test_restart_resumes_pending_delivery(session_factory, session, clock):
-    ev = _seed(session)
+    ev = _resolve(session, _seed(session))
     w1 = _worker(session_factory, FakeSender(DeliveryResult("transient", None, "503")), clock)
     w1.run_once()
     clock.advance(30)
@@ -255,3 +273,178 @@ def test_restart_resumes_pending_delivery(session_factory, session, clock):
     assert w2.run_once() is True
     session.refresh(ev)
     assert ev.stage == STAGE_CLOSED
+
+
+# --- fetch -----------------------------------------------------------------
+
+FETCH_OK_RESULT = FetchResult("Qualifications\n" + "x" * 400, "api.lever.co", "lever", "ok", None)
+FETCH_TRANSIENT = FetchResult(None, "api.lever.co", "lever", "transient", "HTTP 503")
+FETCH_PERMANENT = FetchResult(None, "careers.x.com", "page", "permanent", "HTTP 404")
+
+
+class FakeFetcher:
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, url):
+        self.calls.append(url)
+        return self.results.pop(0) if self.results else FETCH_OK_RESULT
+
+
+def _worker_f(session_factory, fetcher, clock, sender=None, users=(RON, COUSIN)):
+    return Worker(session_factory, list(users), send=sender or FakeSender(), fetch=fetcher, now=clock)
+
+
+def test_new_jobs_are_pending_fetch_and_not_delivered_yet(session_factory, session, clock):
+    ev = _seed(session)
+    assert ev.job.fetch_status == FETCH_PENDING
+    sender = FakeSender()
+    w = _worker_f(session_factory, FakeFetcher(FETCH_TRANSIENT), clock, sender)
+    w.run_once()                              # fetch attempt, transient
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER
+    assert sender.calls == []                 # gated on fetch
+
+
+def test_fetch_ok_stores_description_and_then_delivers(session_factory, session, clock):
+    ev = _seed(session)
+    fetcher = FakeFetcher(FETCH_OK_RESULT)
+    sender = FakeSender(OK)
+    w = _worker_f(session_factory, fetcher, clock, sender)
+    assert w.run_once() is True               # fetch
+    session.refresh(ev); session.refresh(ev.job)
+    job = ev.job
+    assert job.fetch_status == FETCH_OK
+    assert job.description.startswith("Qualifications")
+    assert job.description_truncated is False
+    assert job.fetch_host == "api.lever.co"
+    assert job.fetch_strategy == "lever"
+    assert job.has_requirements is True
+    assert job.fetch_attempts == 1
+    assert fetcher.calls == [job.url]
+    clock.advance(FETCH_GAP_SECONDS)
+    assert w.run_once() is True               # deliver
+    session.refresh(ev)
+    assert ev.stage == STAGE_CLOSED and ev.outcome is None
+    assert "couldn't read" not in sender.calls[0][1]
+
+
+def test_fetch_marks_truncated_when_over_cap(session_factory, session, clock):
+    from fetcher import DESCRIPTION_CAP
+    ev = _seed(session)
+    big = FetchResult("Requirements " + "y" * (DESCRIPTION_CAP + 10), "h", "page", "ok", None)
+    w = _worker_f(session_factory, FakeFetcher(big), clock)
+    w.run_once()
+    session.refresh(ev.job)
+    assert ev.job.description_truncated is True
+    assert len(ev.job.description) > DESCRIPTION_CAP     # full text kept
+
+
+def test_fetch_transient_backs_off_and_records_first_attempt(session_factory, session, clock):
+    ev = _seed(session)
+    w = _worker_f(session_factory, FakeFetcher(FETCH_TRANSIENT), clock)
+    w.run_once()
+    session.refresh(ev.job)
+    job = ev.job
+    assert job.fetch_status == FETCH_PENDING
+    assert job.fetch_attempts == 1
+    assert job.fetch_first_attempt_at == T0
+    assert job.fetch_error == "HTTP 503"
+    assert job.next_attempt_at == T0 + timedelta(seconds=30)
+
+
+def test_fetch_permanent_fails_job_and_stamps_evaluations(session_factory, session, clock):
+    ev_ron = _seed(session, "ron")
+    ev_cousin = _seed(session, "cousin")     # different job; untouched
+    w = _worker_f(session_factory, FakeFetcher(FETCH_PERMANENT), clock)
+    w.run_once()
+    session.refresh(ev_ron); session.refresh(ev_ron.job); session.refresh(ev_cousin)
+    assert ev_ron.job.fetch_status == FETCH_FAILED
+    assert ev_ron.job.fetch_error == "HTTP 404"
+    assert ev_ron.outcome == "fetch_failed" and ev_ron.stage == STAGE_DELIVER
+    assert ev_cousin.outcome is None
+
+
+def test_fetch_failed_delivers_link_only_with_note(session_factory, session, clock):
+    ev = _seed(session)
+    sender = FakeSender(OK)
+    w = _worker_f(session_factory, FakeFetcher(FETCH_PERMANENT), clock, sender)
+    w.run_once()                              # fetch → failed
+    clock.advance(FETCH_GAP_SECONDS)
+    w.run_once()                              # deliver
+    session.refresh(ev)
+    assert ev.stage == STAGE_CLOSED and ev.outcome == "fetch_failed"
+    assert "(couldn't read the description)" in sender.calls[0][1]
+
+
+def test_fetch_budget_exhausted_by_attempts(session_factory, session, clock):
+    ev = _seed(session)
+    w = _worker_f(session_factory, FakeFetcher(*[FETCH_TRANSIENT] * FETCH_BUDGET), clock)
+    for _ in range(FETCH_BUDGET):
+        assert w.run_once() is True
+        clock.advance(3600)
+    session.refresh(ev); session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_FAILED
+    assert ev.job.fetch_attempts == FETCH_BUDGET
+    assert "budget" in ev.job.fetch_error
+    assert ev.outcome == "fetch_failed"
+
+
+def test_fetch_budget_exhausted_by_age(session_factory, session, clock):
+    ev = _seed(session)
+    w = _worker_f(session_factory, FakeFetcher(FETCH_TRANSIENT, FETCH_TRANSIENT), clock)
+    w.run_once()                              # attempt 1 at T0
+    clock.advance(FETCH_MAX_AGE_HOURS * 3600 + 1)
+    w.run_once()                              # attempt 2, now older than the age limit
+    session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_FAILED
+    assert ev.job.fetch_attempts == 2
+
+
+def test_fetch_skips_jobs_nobody_is_waiting_on(session_factory, session, clock):
+    ev = _seed(session, stage=STAGE_CLOSED)   # only evaluation already closed
+    fetcher = FakeFetcher()
+    w = _worker_f(session_factory, fetcher, clock)
+    assert w.run_once() is False
+    assert fetcher.calls == []
+    session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_PENDING
+
+
+def test_fetch_respects_gap_between_fetches(session_factory, session, clock):
+    _seed(session, "ron")
+    _seed(session, "cousin")                  # two jobs pending
+    fetcher = FakeFetcher(FETCH_OK_RESULT, FETCH_OK_RESULT)
+    w = _worker_f(session_factory, fetcher, clock)
+    assert w.run_once() is True               # fetch #1
+    assert w.run_once() is True               # deliver #1 (fetch #2 must wait for the gap)
+    assert len(fetcher.calls) == 1
+    clock.advance(FETCH_GAP_SECONDS)
+    assert w.run_once() is True               # fetch #2
+    assert len(fetcher.calls) == 2
+
+
+def test_fetcher_exception_is_a_transient_attempt(session_factory, session, clock):
+    ev = _seed(session)
+
+    def boom(url):
+        raise RuntimeError("parser exploded")
+
+    w = _worker_f(session_factory, boom, clock)
+    w.run_once()
+    session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_PENDING
+    assert ev.job.fetch_attempts == 1
+    assert "RuntimeError" in ev.job.fetch_error
+
+
+def test_restart_resumes_pending_fetch(session_factory, session, clock):
+    ev = _seed(session)
+    w1 = _worker_f(session_factory, FakeFetcher(FETCH_TRANSIENT), clock)
+    w1.run_once()
+    clock.advance(30)
+    w2 = _worker_f(session_factory, FakeFetcher(FETCH_OK_RESULT), clock)   # restart
+    assert w2.run_once() is True
+    session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_OK and ev.job.fetch_attempts == 2

@@ -6,7 +6,7 @@ import pytest
 import main
 import state
 from config import FEEDS, Settings
-from db import STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
+from db import FETCH_OK, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
 from tests.test_poller import README_V1, README_V2
 from users import User
 
@@ -77,6 +77,10 @@ def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
         assert ev.stage == STAGE_DELIVER
         assert ev.user_id == "ron"
         ev_id = ev.id
+        # Delivery is gated on the description fetch; resolve it here so this test
+        # keeps exercising poll → deliver without touching the network.
+        ev.job.fetch_status = FETCH_OK
+        session.commit()
 
     # Worker delivers it through the real discord_client.
     ok = Mock(status_code=200, headers={}, json=lambda: {"id": "1"})
