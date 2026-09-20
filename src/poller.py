@@ -37,15 +37,16 @@ def poll_feed(
         return PollResult(False, 0, 0)
 
     previous_sha = feed.last_sha
-    seeding = previous_sha is None
     readme = get_readme_content(spec.repo, current_sha)
     if readme is None:
-        log.warning("[%s] README missing at %s; advancing SHA", spec.name, current_sha[:7])
-        feed.last_sha = current_sha
-        session.commit()
+        # raw.githubusercontent.com can lag the commits API. Leave last_sha alone so the
+        # next poll retries this SHA instead of treating the whole README as new.
+        log.warning("[%s] README missing at %s; will retry next poll", spec.name, current_sha[:7])
         return PollResult(True, 0, 0)
 
     known = {k for (k,) in session.query(Job.url_key).filter_by(feed_id=feed.id).all()}
+    # A feed with no jobs is always seeded silently, whatever last_sha says.
+    seeding = previous_sha is None or not known
     jobs_added = evals_added = 0
     for section, rows in parse_sections(readme).items():
         for row in rows:

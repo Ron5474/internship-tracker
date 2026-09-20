@@ -88,11 +88,34 @@ def test_job_in_unsubscribed_section_gets_no_evaluation(db):
     assert result.evaluations_added == 0
 
 
-def test_readme_missing_advances_sha_without_changes(db):
+def test_readme_missing_leaves_sha_and_jobs_untouched(db):
+    # raw.githubusercontent.com can lag the commits API; a missing README must not
+    # advance last_sha, or the next poll would treat the whole feed as new.
     poll_feed(db, SPEC, [RON], *_github("s1", README_V1))
+    jobs_before = db.query(Job).count()
     result = poll_feed(db, SPEC, [RON], (lambda r, b: "s2"), (lambda r, s: None))
-    assert result.sha_changed and result.jobs_added == 0
-    assert db.query(Feed).filter_by(name="internships").one().last_sha == "s2"
+    assert result.sha_changed is True
+    assert result.jobs_added == 0
+    assert db.query(Feed).filter_by(name="internships").one().last_sha == "s1"
+    assert db.query(Job).count() == jobs_before == 2
+
+
+def test_readme_missing_then_present_seeds_without_evaluations(db):
+    poll_feed(db, SPEC, [RON], (lambda r, b: "s1"), (lambda r, s: None))
+    result = poll_feed(db, SPEC, [RON], *_github("s2", README_V1))
+    assert result.jobs_added > 0
+    assert result.evaluations_added == 0
+    assert db.query(Evaluation).count() == 0
+
+
+def test_feed_with_sha_but_no_jobs_is_seeded(db):
+    feed = db.query(Feed).filter_by(name="internships").one()
+    feed.last_sha = "old"
+    db.commit()
+    result = poll_feed(db, SPEC, [RON], *_github("s1", README_V1))
+    assert result.jobs_added == 2
+    assert result.evaluations_added == 0
+    assert db.query(Evaluation).count() == 0
 
 
 def test_same_url_in_two_feeds_yields_two_jobs(db):
