@@ -1,7 +1,12 @@
+from unittest.mock import Mock, patch
+
+import requests
+
 from fetcher import (
     MIN_DESCRIPTION_CHARS,
     FetchResult,
     classify_status,
+    fetch_via_api,
     has_requirements,
     html_to_text,
     match_ats,
@@ -91,3 +96,122 @@ def test_classify_status():
 def test_fetch_result_ok_property():
     assert FetchResult("x" * MIN_DESCRIPTION_CHARS, "h", "lever", "ok", None).ok
     assert not FetchResult(None, "h", "none", "permanent", "404").ok
+
+
+# --- ATS API handlers ---------------------------------------------------------
+
+LONG = "Responsibilities: build things. " * 20  # > MIN_DESCRIPTION_CHARS
+
+
+def _resp(status, body=None, text=""):
+    r = Mock()
+    r.status_code = status
+    r.headers = {}
+    r.text = text
+    if body is None:
+        r.json.side_effect = ValueError("no json")
+    else:
+        r.json.return_value = body
+    return r
+
+
+def test_greenhouse_handler_unescapes_content():
+    body = {"content": "&lt;h3&gt;Qualifications&lt;/h3&gt;&lt;p&gt;" + LONG + "&lt;/p&gt;"}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)) as get:
+        r = fetch_via_api("greenhouse", {"board": "togetherai", "job_id": "5211582007"})
+    assert get.call_args.args[0] == "https://boards-api.greenhouse.io/v1/boards/togetherai/jobs/5211582007"
+    assert r.ok and r.strategy == "greenhouse" and r.host == "boards-api.greenhouse.io"
+    assert r.text.startswith("Qualifications\nResponsibilities")
+
+
+def test_lever_handler_joins_description_lists_and_additional():
+    body = {
+        "descriptionPlain": LONG,
+        "lists": [{"text": "Requirements", "content": "<li>Python</li><li>SQL</li>"}],
+        "additionalPlain": "EEO statement.",
+    }
+    with patch("fetcher.requests.get", return_value=_resp(200, body)) as get:
+        r = fetch_via_api("lever", {"company": "steerbridge", "uuid": "718b3135-d15d-4cbc-9541-1cbb8a6f5ec5"})
+    assert get.call_args.args[0] == "https://api.lever.co/v0/postings/steerbridge/718b3135-d15d-4cbc-9541-1cbb8a6f5ec5"
+    assert r.ok
+    assert "Requirements\nPython\nSQL" in r.text
+    assert r.text.endswith("EEO statement.")
+
+
+def test_ashby_handler_picks_posting_by_uuid_in_joburl():
+    body = {"jobs": [
+        {"jobUrl": "https://jobs.ashbyhq.com/meow/other-uuid", "descriptionPlain": "wrong"},
+        {"jobUrl": "https://jobs.ashbyhq.com/meow/56e3b840-11a0-4e98-baca-44e8e26b5218", "descriptionPlain": LONG},
+    ]}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)) as get:
+        r = fetch_via_api("ashby", {"company": "meow", "uuid": "56e3b840-11a0-4e98-baca-44e8e26b5218"})
+    assert get.call_args.args[0] == "https://api.ashbyhq.com/posting-api/job-board/meow"
+    assert r.ok and r.text == LONG.strip()
+
+
+def test_ashby_handler_permanent_when_uuid_not_on_board():
+    body = {"jobs": [{"jobUrl": "https://jobs.ashbyhq.com/meow/other", "descriptionPlain": LONG}]}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)):
+        r = fetch_via_api("ashby", {"company": "meow", "uuid": "56e3b840-11a0-4e98-baca-44e8e26b5218"})
+    assert r.kind == "permanent" and "not on board" in r.error
+
+
+def test_smartrecruiters_handler_joins_sections_in_order():
+    body = {"jobAd": {"sections": {
+        "companyDescription": {"text": "<p>About us</p>"},
+        "jobDescription": {"text": "<p>" + LONG + "</p>"},
+        "qualifications": {"text": "<ul><li>Degree</li></ul>"},
+        "additionalInformation": {"text": "<p>Extra</p>"},
+    }}}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)) as get:
+        r = fetch_via_api("smartrecruiters", {"company": "GDMSI", "posting_id": "744000145530335"})
+    assert get.call_args.args[0] == "https://api.smartrecruiters.com/v1/companies/GDMSI/postings/744000145530335"
+    assert r.ok
+    assert r.text.index("Responsibilities") < r.text.index("Degree") < r.text.index("Extra")
+    assert "About us" not in r.text
+
+
+def test_workday_handler_builds_cxs_url_and_reads_job_description():
+    body = {"jobPostingInfo": {"jobDescription": "<p><b>Overview</b></p><p>" + LONG + "</p>"}}
+    with patch("fetcher.requests.get", return_value=_resp(200, body)) as get:
+        r = fetch_via_api("workday", {"tenant": "toyota", "wd": "wd503", "site": "tmna",
+                                      "path": "Plano-Texas/Software-Engineer_10325071"})
+    assert get.call_args.args[0] == (
+        "https://toyota.wd503.myworkdayjobs.com/wday/cxs/toyota/tmna/job/Plano-Texas/Software-Engineer_10325071")
+    assert r.ok and r.strategy == "workday" and r.host == "toyota.wd503.myworkdayjobs.com"
+    assert r.text.startswith("Overview\nResponsibilities")
+
+
+def test_api_404_is_permanent():
+    with patch("fetcher.requests.get", return_value=_resp(404, None, "nope")):
+        r = fetch_via_api("greenhouse", {"board": "x", "job_id": "1"})
+    assert r.kind == "permanent" and "404" in r.error and r.text is None
+
+
+def test_api_503_is_transient():
+    with patch("fetcher.requests.get", return_value=_resp(503, None)):
+        assert fetch_via_api("lever", {"company": "x", "uuid": "0" * 8 + "-0000-0000-0000-" + "0" * 12}).kind == "transient"
+
+
+def test_api_timeout_is_transient():
+    with patch("fetcher.requests.get", side_effect=requests.Timeout("slow")):
+        r = fetch_via_api("workday", {"tenant": "t", "wd": "wd1", "site": "s", "path": "p"})
+    assert r.kind == "transient" and "slow" in r.error
+
+
+def test_api_non_json_200_is_permanent():
+    with patch("fetcher.requests.get", return_value=_resp(200, None, "<html>login</html>")):
+        assert fetch_via_api("smartrecruiters", {"company": "x", "posting_id": "1"}).kind == "permanent"
+
+
+def test_api_short_description_is_permanent():
+    with patch("fetcher.requests.get", return_value=_resp(200, {"descriptionPlain": "Short.", "lists": []})):
+        r = fetch_via_api("lever", {"company": "x", "uuid": "0" * 8 + "-0000-0000-0000-" + "0" * 12})
+    assert r.kind == "permanent" and "too short" in r.error
+
+
+def test_api_calls_use_timeout_and_user_agent():
+    with patch("fetcher.requests.get", return_value=_resp(200, {"content": LONG})) as get:
+        fetch_via_api("greenhouse", {"board": "b", "job_id": "1"})
+    assert get.call_args.kwargs["timeout"] == 15
+    assert "Mozilla" in get.call_args.kwargs["headers"]["User-Agent"]
