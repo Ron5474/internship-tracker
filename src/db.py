@@ -12,6 +12,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    inspect,
+    text,
 )
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -67,6 +69,8 @@ class Job(Base):
     fetch_status: Mapped[str] = mapped_column(String, default=FETCH_PENDING)
     fetch_host: Mapped[str | None] = mapped_column(String, nullable=True)
     fetch_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    fetch_strategy: Mapped[str | None] = mapped_column(String, nullable=True)
+    has_requirements: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     fetch_attempts: Mapped[int] = mapped_column(Integer, default=0)
     fetch_first_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -166,3 +170,24 @@ def import_legacy_state(session: Session, data_dir: str) -> int:
     feed.last_sha = read_last_sha(data_dir)
     session.flush()
     return len(known)
+
+
+def ensure_columns(engine: Engine) -> list[str]:
+    """Add columns that exist in the models but not in an existing database.
+
+    create_all() only creates missing tables. Each plan that adds a column
+    relies on this to upgrade a data dir that predates it. SQLite supports
+    ADD COLUMN for nullable columns without a rebuild, which is all we need.
+    """
+    added: list[str] = []
+    inspector = inspect(engine)
+    for table in Base.metadata.sorted_tables:
+        existing = {c["name"] for c in inspector.get_columns(table.name)}
+        for column in table.columns:
+            if column.name in existing:
+                continue
+            ddl = f"ALTER TABLE {table.name} ADD COLUMN {column.name} {column.type.compile(engine.dialect)}"
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
+            added.append(f"{table.name}.{column.name}")
+    return added

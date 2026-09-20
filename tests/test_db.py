@@ -2,6 +2,7 @@ import tempfile
 from datetime import datetime
 
 import pytest
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 from config import FEEDS
@@ -12,6 +13,7 @@ from db import (
     Evaluation,
     Feed,
     Job,
+    ensure_columns,
     ensure_feeds,
     import_legacy_state,
     utcnow,
@@ -141,3 +143,40 @@ def test_import_legacy_noop_on_fresh_data_dir(session):
         session.commit()
         assert import_legacy_state(session, d) == 0
     assert session.query(Job).count() == 0
+
+
+def test_job_has_fetch_strategy_and_has_requirements(session):
+    feed = Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed)
+    session.add_all([feed, job])
+    session.commit()
+    assert job.fetch_strategy is None
+    assert job.has_requirements is None
+    job.fetch_strategy = "lever"
+    job.has_requirements = True
+    session.commit()
+    assert session.get(Job, job.id).fetch_strategy == "lever"
+
+
+def test_ensure_columns_adds_missing_columns_to_existing_db(tmp_path):
+    from db import init_db, make_engine
+    engine = make_engine(str(tmp_path / "old.db"))
+    init_db(engine)
+    # Simulate a database created before this plan: drop the two new columns.
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE jobs DROP COLUMN fetch_strategy"))
+        conn.execute(text("ALTER TABLE jobs DROP COLUMN has_requirements"))
+    assert "fetch_strategy" not in {c["name"] for c in inspect(engine).get_columns("jobs")}
+
+    added = ensure_columns(engine)
+
+    assert sorted(added) == ["jobs.fetch_strategy", "jobs.has_requirements"]
+    cols = {c["name"] for c in inspect(engine).get_columns("jobs")}
+    assert {"fetch_strategy", "has_requirements"} <= cols
+
+
+def test_ensure_columns_is_noop_when_current(tmp_path):
+    from db import init_db, make_engine
+    engine = make_engine(str(tmp_path / "new.db"))
+    init_db(engine)
+    assert ensure_columns(engine) == []
