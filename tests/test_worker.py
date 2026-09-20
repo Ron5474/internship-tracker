@@ -474,3 +474,17 @@ def test_fetch_lease_survives_crash_mid_fetch(session_factory, session, clock):
     assert w2.run_once() is True
     session.refresh(ev.job)
     assert ev.job.fetch_status == FETCH_OK and ev.job.fetch_attempts == 2
+
+
+def test_fail_fetch_stamps_only_open_evaluations_without_outcome(session_factory, session, clock):
+    ev_ron = _seed(session, "ron")
+    ev_cousin = Evaluation(job=ev_ron.job, user_id="cousin", next_attempt_at=T0, outcome="score_failed")
+    ev_ghost = Evaluation(job=ev_ron.job, user_id="ghost", next_attempt_at=T0, stage=STAGE_CLOSED)
+    session.add_all([ev_cousin, ev_ghost]); session.commit()
+
+    w = _worker_f(session_factory, FakeFetcher(FETCH_PERMANENT), clock)
+    assert w.run_once() is True
+    session.refresh(ev_ron); session.refresh(ev_cousin); session.refresh(ev_ghost)
+    assert ev_ron.outcome == "fetch_failed"
+    assert ev_cousin.outcome == "score_failed"           # pre-set outcome untouched
+    assert ev_ghost.outcome is None and ev_ghost.stage == STAGE_CLOSED

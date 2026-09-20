@@ -45,3 +45,5 @@ UPDATE jobs SET fetch_status='pending', fetch_attempts=0, fetch_first_attempt_at
        next_attempt_at=datetime('now') WHERE id = <job id>;
 UPDATE evaluations SET outcome=NULL WHERE job_id = <job id> AND stage != 'closed';
 ```
+
+The worker only fetches jobs that still have an open (non-`closed`) evaluation. If the job's evaluations were already delivered, the reset has no effect.
