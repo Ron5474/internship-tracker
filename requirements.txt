@@ -3,3 +3,4 @@ python-dotenv==1.0.1
 SQLAlchemy==2.0.54
 pydantic==2.13.5
 PyYAML==6.0.3
+trafilatura==2.2.0
