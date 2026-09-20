@@ -3,6 +3,6 @@ services:
     image: ronp2805/internship-tracker:latest
     restart: always
     volumes:
-      - ./data:/data
+      - ./data:/data   # users.yaml, tracker.db, (later) cvs/ and output/
     env_file:
       - .env

@@ -1,91 +1,75 @@
+import functools
 import logging
 import os
+import threading
 import time
 
 from dotenv import load_dotenv
 
-from discord_client import format_message, send_notification
+from config import FEEDS, Settings, load_settings
+from db import ensure_feeds, import_legacy_state, init_db, make_engine, make_session_factory
 from github_client import get_latest_sha, get_readme_content
 from migration import migrate_state
-from parser import find_new_rows, parse_sections, url_key
-from state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
+from poller import poll_feed
+from users import User, load_users
+from worker import Worker
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
-log = logging.getLogger(__name__)
-
-REPO = "SimplifyJobs/Summer2026-Internships"
-BRANCH = "dev"
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "300"))
-FILTER_SECTIONS = [
-    s.strip().lower()
-    for s in os.getenv("FILTER_SECTIONS", "software engineering,product management,data science").split(",")
-]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+log = logging.getLogger("main")
 
 
-def poll() -> None:
-    current_sha = get_latest_sha(REPO, BRANCH, GITHUB_TOKEN)
-    last_sha = read_last_sha(DATA_DIR)
-    known_urls = {url_key(u) for u in read_known_urls(DATA_DIR)}
+def build(settings: Settings, users: list[User]):
+    engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
+    init_db(engine)
+    session_factory = make_session_factory(engine)
+    with session_factory() as session:
+        ensure_feeds(session, FEEDS.values())
+        seeded = import_legacy_state(session, settings.data_dir)
+        session.commit()
+    if seeded:
+        log.info("Imported %d jobs from legacy known_urls.json", seeded)
+    return session_factory, Worker(session_factory, users)
 
-    if last_sha is None or not known_urls:
-        readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
-        if readme:
-            sections = parse_sections(readme)
-            all_urls = {url_key(r["url"]) for rows in sections.values() for r in rows}
-            write_known_urls(DATA_DIR, all_urls)
-        write_last_sha(DATA_DIR, current_sha)
-        log.info("Initialized state — recording SHA %s, no notifications sent", current_sha[:7])
-        return
 
-    if current_sha == last_sha:
-        log.debug("No new commits")
-        return
+def poll_all(session_factory, users: list[User], settings: Settings) -> None:
+    latest_sha = functools.partial(get_latest_sha, token=settings.github_token)
+    readme = functools.partial(get_readme_content, token=settings.github_token)
+    for spec in FEEDS.values():
+        try:
+            with session_factory() as session:
+                poll_feed(session, spec, users, latest_sha, readme)
+        except Exception:
+            log.exception("[%s] poll failed", spec.name)
 
-    log.info("New commits: %s → %s", last_sha[:7], current_sha[:7])
-    readme = get_readme_content(REPO, current_sha, GITHUB_TOKEN)
 
-    if readme is None:
-        write_last_sha(DATA_DIR, current_sha)
-        return
-
-    sections = parse_sections(readme)
-    new_rows = find_new_rows(sections, known_urls, FILTER_SECTIONS)
-    log.info("New postings in target sections: %d", len(new_rows))
-
-    for posting in new_rows:
-        message = format_message(posting)
-        ok = send_notification(DISCORD_WEBHOOK_URL, message)
-        if ok:
-            log.info("Notified: %s — %s", posting["company"], posting["role"])
-        else:
-            log.error("Failed to notify for %s — %s", posting["company"], posting["role"])
-
-    all_urls = {url_key(r["url"]) for rows in sections.values() for r in rows}
-    write_known_urls(DATA_DIR, all_urls)
-    write_last_sha(DATA_DIR, current_sha)
+def _poll_loop(session_factory, users, settings) -> None:
+    while True:
+        try:
+            poll_all(session_factory, users, settings)
+        except Exception:
+            log.exception("Poll cycle failed")
+        time.sleep(settings.poll_interval)
 
 
 def main() -> None:
-    log.info("Internship tracker started (interval: %ds, sections: %s)", POLL_INTERVAL, FILTER_SECTIONS)
-    migrated = False
-    while True:
-        try:
-            # Never poll against pre-migration state: the old keys would make every job look new.
-            if not migrated:
-                migrated = migrate_state(DATA_DIR, lambda sha: get_readme_content(REPO, sha, GITHUB_TOKEN))
-            if migrated:
-                poll()
-        except Exception as e:
-            log.error("Poll error: %s", e)
-        time.sleep(POLL_INTERVAL)
+    settings = load_settings(os.environ)
+    users = load_users(os.path.join(settings.data_dir, "users.yaml"))
+    log.info("Tracker starting: %d users, feeds %s, interval %ds",
+             len(users), list(FEEDS), settings.poll_interval)
+
+    # Bring pre-pipeline state files to version 2 first (PR #1). Retry until GitHub answers.
+    internships = FEEDS["internships"]
+    while not migrate_state(settings.data_dir,
+                            lambda sha: get_readme_content(internships.repo, sha, settings.github_token)):
+        log.error("State migration failed; retrying in 60s")
+        time.sleep(60)
+
+    session_factory, worker = build(settings, users)
+
+    threading.Thread(target=_poll_loop, args=(session_factory, users, settings), name="poller", daemon=True).start()
+    worker.run_forever()
 
 
 if __name__ == "__main__":
