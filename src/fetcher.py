@@ -36,10 +36,12 @@ class FetchResult:
 
 _BLOCK_CLOSE = re.compile(r"</(p|div|li|h[1-6]|tr|td|th|ul|ol|section|article|blockquote)\s*>|<br\s*/?>", re.I)
 _TAG = re.compile(r"<[^>]+>")
+# Line-anchored: html_to_text and trafilatura emit one block per line, so section
+# headings sit at line start. Unanchored keywords matched EEO/"minimum wage" boilerplate.
 _REQUIREMENTS = re.compile(
-    r"\b(requirements?|qualifications?|what you.ll need|what we.re looking for|must[- ]haves?|minimum"
-    r"|basic qualifications|you have|you bring)\b",
-    re.I,
+    r"^\s*(?:requirements?|qualifications?|what you.ll need|what we.re looking for|must[- ]haves?"
+    r"|minimum (?:qualifications|requirements)|basic qualifications|you bring)\b",
+    re.I | re.M,
 )
 
 

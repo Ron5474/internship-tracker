@@ -47,14 +47,26 @@ def test_html_to_text_separates_table_cells():
 
 # --- has_requirements --------------------------------------------------------
 
-def test_has_requirements_true_on_common_headings():
-    assert has_requirements("About us\n\nQualifications\n- Python")
-    assert has_requirements("What you'll need: 2 years")
-    assert has_requirements("Basic Qualifications")
+def test_has_requirements_true_on_heading_lines():
+    for text in (
+        "About us\n\nQualifications\n- Python",
+        "Intro\nWhat you'll need:\n2 years",
+        "Basic Qualifications\n...",
+        "Minimum Qualifications\nBS",
+        "  Requirements\n...",           # leading spaces
+    ):
+        assert has_requirements(text), text
 
 
-def test_has_requirements_false_without_keywords():
-    assert not has_requirements("We are a fun company. Apply now.")
+def test_has_requirements_false_on_boilerplate():
+    for text in (
+        "If you have a disability and need an accommodation, contact us.",
+        "Do you have what it takes?",
+        "We pay above minimum wage.",
+        "We are a fun company. Apply now.",
+        "the requirements are listed elsewhere",   # mid-line, not a heading
+    ):
+        assert not has_requirements(text), text
 
 
 # --- match_ats ---------------------------------------------------------------
