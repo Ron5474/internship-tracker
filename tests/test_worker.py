@@ -448,3 +448,29 @@ def test_restart_resumes_pending_fetch(session_factory, session, clock):
     assert w2.run_once() is True
     session.refresh(ev.job)
     assert ev.job.fetch_status == FETCH_OK and ev.job.fetch_attempts == 2
+
+
+class _Crash(BaseException):
+    """Escapes the worker's `except Exception` guard, like SIGKILL/OOM would."""
+
+
+def test_fetch_lease_survives_crash_mid_fetch(session_factory, session, clock):
+    ev = _seed(session)
+
+    def crash(url):
+        raise _Crash()
+
+    w1 = _worker_f(session_factory, crash, clock)
+    with pytest.raises(_Crash):
+        w1.run_once()
+    session.refresh(ev.job)
+    assert ev.job.fetch_attempts == 1                       # lease persisted
+    assert ev.job.fetch_first_attempt_at == T0
+    assert ev.job.next_attempt_at == T0 + timedelta(seconds=30)
+
+    w2 = _worker_f(session_factory, FakeFetcher(FETCH_OK_RESULT), clock)   # restart
+    assert w2.run_once() is False                           # not first in line until the lease expires
+    clock.advance(30)
+    assert w2.run_once() is True
+    session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_OK and ev.job.fetch_attempts == 2

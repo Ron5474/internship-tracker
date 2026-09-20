@@ -136,6 +136,10 @@ class Worker:
         if job.fetch_first_attempt_at is None:
             job.fetch_first_attempt_at = now
         job.fetch_attempts += 1
+        # Lease: commit the attempt before the network call so a hard crash mid-fetch
+        # (OOM, SIGKILL) still consumes budget instead of re-picking this job first on restart.
+        job.next_attempt_at = now + timedelta(seconds=backoff(job.fetch_attempts))
+        session.commit()
         try:
             result = self._fetch(job.url)
         except Exception as e:  # noqa: BLE001 — a fetcher bug is a failed attempt, not a dead worker
