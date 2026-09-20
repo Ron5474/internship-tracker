@@ -57,6 +57,8 @@ Every `POLL_INTERVAL_SECONDS`, for each configured feed:
 3. Fetch the README at that SHA, parse with `parser` (as fixed in PR #1) into sections → rows.
 4. In **one transaction**: insert rows whose `(feed, url_key)` is not already in `jobs`; for each inserted job create one `evaluations` row per user whose `feeds` includes this feed and whose `sections` matches the job's section (substring match, as today); update `feeds.last_sha`. If the process dies mid-poll nothing is written and the poll repeats next interval.
 
+If the README cannot be fetched at that SHA, log a warning and leave `last_sha` unchanged; the poll repeats next interval. A feed with no jobs is always seeded silently, regardless of `last_sha`.
+
 First run for a feed (no `last_sha`): insert all rows as seeded — no `evaluations` rows are created — so no notification flood.
 
 Feeds are defined in code:
@@ -119,7 +121,7 @@ evaluations  id, job_id, user_id,
 
 `stage` is the next action to run. `outcome` is written once, at the moment a fallback decision is made (for example `tailor_failed` when the tailor budget runs out and the row moves to `stage=deliver`), and is never overwritten — so the delivered message and the database both say why the resume is missing. Delivery has its own attempt counter and error column so a failed send never disturbs the outcome or the stage budget.
 
-A row reaches `closed` in exactly two ways: Discord confirms the final message (match, match-without-PDF, or link-only fallback), or the score is below the user's threshold (`outcome=below_threshold`, nothing sent). A crash between deciding to notify and Discord confirming leaves the row at `stage=deliver` and it is retried.
+A row reaches `closed` in exactly two ways: Discord confirms the final message (match, match-without-PDF, or link-only fallback), or the score is below the user's threshold (`outcome=below_threshold`, nothing sent). A crash between deciding to notify and Discord confirming leaves the row at `stage=deliver` and it is retried. A row whose `user_id` is no longer in `users.yaml` pauses that destination until restart and stays at its stage.
 
 ### Migration from current state files
 

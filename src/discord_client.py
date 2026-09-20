@@ -90,9 +90,10 @@ def _retry_after(resp) -> float | None:
     raw = resp.headers.get("Retry-After")
     if raw is None:
         try:
-            raw = resp.json().get("retry_after")
+            body = resp.json()
         except ValueError:
-            raw = None
+            body = None
+        raw = body.get("retry_after") if isinstance(body, dict) else None
     try:
         return float(raw) if raw is not None else None
     except (TypeError, ValueError):

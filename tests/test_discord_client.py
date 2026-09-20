@@ -79,6 +79,30 @@ def test_send_429_is_transient_with_retry_after():
     assert result.retry_after == 7.0
 
 
+def test_send_200_without_message_body_is_transient():
+    # Discord only confirms a message by returning it; a bare 200 proves nothing.
+    with patch("discord_client.requests.post", return_value=_resp(200, {})):
+        assert send_message(WEBHOOK, "hi").kind == "transient"
+    broken = _resp(200)
+    broken.json.side_effect = ValueError("not json")
+    with patch("discord_client.requests.post", return_value=broken):
+        assert send_message(WEBHOOK, "hi").kind == "transient"
+
+
+def test_send_429_reads_retry_after_from_json_body():
+    with patch("discord_client.requests.post", return_value=_resp(429, {"retry_after": 3.5})):
+        result = send_message(WEBHOOK, "hi")
+    assert result.kind == "transient"
+    assert result.retry_after == 3.5
+
+
+def test_send_429_with_non_dict_body_has_no_retry_after():
+    with patch("discord_client.requests.post", return_value=_resp(429, ["not", "a", "dict"])):
+        result = send_message(WEBHOOK, "hi")
+    assert result.kind == "transient"
+    assert result.retry_after is None
+
+
 def test_send_5xx_is_transient():
     with patch("discord_client.requests.post", return_value=_resp(503)):
         assert send_message(WEBHOOK, "hi").kind == "transient"

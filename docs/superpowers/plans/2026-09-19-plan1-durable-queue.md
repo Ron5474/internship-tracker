@@ -1037,6 +1037,8 @@ git commit -m "feat: confirmed Discord delivery with wait=true, error classes an
 
 ### Task 6: Poller
 
+> **Corrected after final review:** a README that cannot be fetched at the new SHA must *not* advance `last_sha` — the poller logs a warning and returns, retrying next interval (otherwise a first poll against a lagging raw.githubusercontent.com leaves `last_sha` set with zero jobs and the next poll floods every row). Seeding is `previous_sha is None or not known`: a feed with no jobs is always seeded silently. The test `test_readme_missing_advances_sha_without_changes` below became `test_readme_missing_leaves_sha_and_jobs_untouched` (plus `test_readme_missing_then_present_seeds_without_evaluations` and `test_feed_with_sha_but_no_jobs_is_seeded`).
+
 **Files:**
 - Create: `src/poller.py`
 - Test: `tests/test_poller.py`
@@ -1140,11 +1142,12 @@ def test_job_in_unsubscribed_section_gets_no_evaluation(db):
     assert result.evaluations_added == 0
 
 
-def test_readme_missing_advances_sha_without_changes(db):
+def test_readme_missing_leaves_sha_and_jobs_untouched(db):
     poll_feed(db, SPEC, [RON], *_github("s1", README_V1))
     result = poll_feed(db, SPEC, [RON], (lambda r, b: "s2"), (lambda r, s: None))
-    assert result.sha_changed and result.jobs_added == 0
-    assert db.query(Feed).filter_by(name="internships").one().last_sha == "s2"
+    assert result.sha_changed is True and result.jobs_added == 0
+    assert db.query(Feed).filter_by(name="internships").one().last_sha == "s1"
+    assert db.query(Job).count() == 2
 
 
 def test_same_url_in_two_feeds_yields_two_jobs(db):
@@ -1216,15 +1219,15 @@ def poll_feed(
         return PollResult(False, 0, 0)
 
     previous_sha = feed.last_sha
-    seeding = previous_sha is None
     readme = get_readme_content(spec.repo, current_sha)
     if readme is None:
-        log.warning("[%s] README missing at %s; advancing SHA", spec.name, current_sha[:7])
-        feed.last_sha = current_sha
-        session.commit()
+        # Log and return without touching last_sha; the poll repeats next interval.
+        log.warning("[%s] README missing at %s; will retry next poll", spec.name, current_sha[:7])
         return PollResult(True, 0, 0)
 
     known = {k for (k,) in session.query(Job.url_key).filter_by(feed_id=feed.id).all()}
+    # A feed with no jobs is always seeded silently, whatever last_sha says.
+    seeding = previous_sha is None or not known
     jobs_added = evals_added = 0
     for section, rows in parse_sections(readme).items():
         for row in rows:
@@ -1271,6 +1274,8 @@ git commit -m "feat: transactional feed poller creating per-user evaluations"
 
 ### Task 7: Worker — pause map, backoff, deliver stage
 
+> **Corrected after final review:** (1) a `transient` result also pauses `discord:<user_id>` until the row's `next_attempt_at`, so the same user's other rows are not attempted while one backs off (`invalid` stays per-row); (2) a `user_id` missing from `users.yaml` pauses `discord:<user_id>` until restart and leaves the row at its stage — it is never closed; (3) an exception raised by the sender is recorded as a `transient` attempt, not a worker crash. The code block below carries these edits.
+
 **Files:**
 - Create: `src/worker.py`
 - Test: `tests/test_worker.py`
@@ -1284,7 +1289,7 @@ git commit -m "feat: transactional feed poller creating per-user evaluations"
     - `paused: dict[str, datetime | None]` — key `"discord:<user_id>"` (and `"llm"` in later plans); value `None` = until restart
     - `is_paused(name: str) -> bool`
     - `run_once() -> bool` — does at most one unit of work; returns whether it did anything
-    - `deliver(session, ev: Evaluation) -> None`
+    - `deliver(session, ev: Evaluation) -> None` — `ok` → `closed`; `gone` → pause `discord:<user_id>` until restart; `transient` → count the attempt, back off, and pause `discord:<user_id>` until `next_attempt_at`; `invalid` → count the attempt and back off (row only); unknown `user_id` → pause `discord:<user_id>` until restart, row untouched; sender exception → treated as `transient`
     - `run_forever(idle_sleep: float = 3.0) -> None`
   - `worker.message_for(ev: Evaluation) -> str` — builds the Discord content from the row; in this plan only the link-only variant exists (`outcome=None` → no note; `outcome="fetch_failed"` or `"score_failed"` → note "couldn't read the description"). Later plans extend it.
 
@@ -1613,12 +1618,14 @@ class Worker:
     def deliver(self, session: Session, ev: Evaluation) -> None:
         user = self._users.get(ev.user_id)
         if user is None:
-            ev.delivery_error = f"unknown user {ev.user_id!r}; not in users.yaml"
-            ev.stage = STAGE_CLOSED
-            log.error("Evaluation %d: %s", ev.id, ev.delivery_error)
+            self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml")
             return
 
-        result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
+        try:
+            result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
+        except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
+            log.exception("Sender raised for evaluation %d", ev.id)
+            result = DeliveryResult("transient", None, f"{type(e).__name__}: {e}")
 
         if result.ok:
             ev.delivery_attempts += 1
@@ -1639,6 +1646,8 @@ class Worker:
         level = logging.ERROR if ev.delivery_attempts > DELIVERY_BUDGET else logging.WARNING
         log.log(level, "Delivery to %s failed (attempt %d, %s): %s; retry in %ss",
                 ev.user_id, ev.delivery_attempts, result.kind, result.error, delay)
+        if result.kind == "transient":
+            self._pause(f"discord:{ev.user_id}", ev.next_attempt_at, result.error or result.kind)
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**

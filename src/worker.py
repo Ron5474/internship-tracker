@@ -109,7 +109,11 @@ class Worker:
             self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml")
             return
 
-        result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
+        try:
+            result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
+        except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
+            log.exception("Sender raised for evaluation %d", ev.id)
+            result = DeliveryResult("transient", None, f"{type(e).__name__}: {e}")
 
         if result.ok:
             ev.delivery_attempts += 1

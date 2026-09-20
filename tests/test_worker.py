@@ -185,6 +185,22 @@ def test_invalid_result_does_not_pause_user(session_factory, session, clock):
     assert "discord:ron" not in w.paused
 
 
+def test_sender_exception_counts_as_transient_attempt(session_factory, session, clock):
+    # e.g. the PDF vanished from disk: a failed attempt with backoff, not a worker crash.
+    ev = _seed(session)
+
+    def boom(webhook, content, pdf_path=None):
+        raise OSError("no such file")
+
+    w = _worker(session_factory, boom, clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER
+    assert ev.delivery_attempts == 1
+    assert "OSError" in ev.delivery_error
+    assert ev.next_attempt_at == T0 + timedelta(seconds=30)
+
+
 def test_invalid_request_counts_attempt_and_backs_off(session_factory, session, clock):
     ev = _seed(session)
     w = _worker(session_factory, FakeSender(DeliveryResult("invalid", None, "HTTP 400: bad")), clock)
