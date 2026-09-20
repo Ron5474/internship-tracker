@@ -105,9 +105,8 @@ class Worker:
     def deliver(self, session: Session, ev: Evaluation) -> None:
         user = self._users.get(ev.user_id)
         if user is None:
-            ev.delivery_error = f"unknown user {ev.user_id!r}; not in users.yaml"
-            ev.stage = STAGE_CLOSED
-            log.error("Evaluation %d: %s", ev.id, ev.delivery_error)
+            # Not a delivery outcome: the row waits for a fixed users.yaml + restart.
+            self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml")
             return
 
         result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)

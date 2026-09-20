@@ -210,14 +210,18 @@ def test_after_budget_keeps_retrying_hourly(session_factory, session, clock):
     assert ev.next_attempt_at == clock()
 
 
-def test_unknown_user_id_closes_with_error(session_factory, session, clock):
-    # A row for a user no longer in users.yaml can never be delivered; mark it and move on.
+def test_unknown_user_pauses_destination_and_keeps_row(session_factory, session, clock):
+    # A row for a user no longer in users.yaml waits for a fixed users.yaml + restart;
+    # closed is reserved for confirmed sends and below-threshold scores.
     ev = _seed(session, "ghost")
-    w = _worker(session_factory, FakeSender(), clock)
+    sender = FakeSender()
+    w = _worker(session_factory, sender, clock)
     w.run_once()
     session.refresh(ev)
-    assert ev.stage == STAGE_CLOSED
-    assert "unknown user" in ev.delivery_error
+    assert ev.stage == STAGE_DELIVER
+    assert ev.delivery_attempts == 0
+    assert w.paused == {"discord:ghost": None}
+    assert sender.calls == []
 
 
 def test_closed_rows_are_never_picked(session_factory, session, clock):
