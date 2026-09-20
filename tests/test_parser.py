@@ -30,6 +30,27 @@ _SWE_TABLE = """\
 <td>3mo</td>
 </tr>
 <tr>
+<td>↳</td>
+<td>Site Reliability Intern</td>
+<td>Sunnyvale, CA</td>
+<td><div align="center"><a href="https://careers.google.com/sre"><img alt="Apply"></a></div></td>
+<td>1d</td>
+</tr>
+<tr>
+<td><strong><a href="https://simplify.jobs/c/Ciena">Ciena</a></strong></td>
+<td>ASIC Verification Intern</td>
+<td>Ottawa, ON, Canada</td>
+<td>🔒</td>
+<td>3d</td>
+</tr>
+<tr>
+<td>↳</td>
+<td>Firmware Intern</td>
+<td>Ottawa, ON, Canada</td>
+<td><div align="center"><a href="https://ciena.com/jobs/fw"><img alt="Apply"></a></div></td>
+<td>2d</td>
+</tr>
+<tr>
 <td><strong><a href="https://simplify.jobs/c/Meta">Meta</a></strong></td>
 <td>SWE Intern</td>
 <td>Menlo Park, CA<br>Remote</td>
@@ -108,14 +129,56 @@ def test_parse_sections_swe_key_present():
     assert any("software engineering" in k for k in sections)
 
 
-def test_parse_sections_swe_skips_continuation_and_closed():
+def test_parse_sections_swe_skips_closed_rows():
     sections = parse_sections(SAMPLE_README)
     swe_key = next(k for k in sections if "software engineering" in k)
-    companies = [r["company"] for r in sections[swe_key]]
-    assert "Stripe" in companies
-    assert "Meta" in companies
-    assert "↳" not in companies
-    assert "Google" not in companies
+    urls = [r["url"] for r in sections[swe_key]]
+    assert "https://careers.google.com/closed" not in urls
+
+
+def test_parse_sections_skips_rows_with_locked_application_cell():
+    # The New-Grad feed marks closed postings with 🔒 in the Application column, not the role
+    sections = parse_sections(SAMPLE_README)
+    swe_key = next(k for k in sections if "software engineering" in k)
+    assert all(r["url"] for r in sections[swe_key])
+    assert "ASIC Verification Intern" not in [r["role"] for r in sections[swe_key]]
+
+
+def test_continuation_row_inherits_company_across_locked_application_cell():
+    sections = parse_sections(SAMPLE_README)
+    swe_key = next(k for k in sections if "software engineering" in k)
+    fw = next(r for r in sections[swe_key] if r["url"] == "https://ciena.com/jobs/fw")
+    assert fw["company"] == "Ciena"
+
+
+def test_continuation_row_inherits_previous_company():
+    sections = parse_sections(SAMPLE_README)
+    swe_key = next(k for k in sections if "software engineering" in k)
+    backend = next(r for r in sections[swe_key] if r["url"] == "https://stripe.com/jobs/124")
+    assert backend["company"] == "Stripe"
+    assert backend["role"] == "Backend Engineer Intern"
+
+
+def test_continuation_row_inherits_company_across_closed_row():
+    # Google's first row is closed and filtered out, but its ↳ row is still open
+    sections = parse_sections(SAMPLE_README)
+    swe_key = next(k for k in sections if "software engineering" in k)
+    sre = next(r for r in sections[swe_key] if r["url"] == "https://careers.google.com/sre")
+    assert sre["company"] == "Google"
+
+
+def test_no_company_leaks_into_next_section():
+    # A ↳ row at the top of a section has nothing to inherit from and must be dropped
+    readme = "\n".join([
+        "## 💻 Software Engineering Internship Roles",
+        _SWE_TABLE,
+        "",
+        "## 📊 Product Management Internship Roles",
+        _PM_TABLE.replace("PM Corp", "↳").replace('<strong><a href="https://simplify.jobs/c/PMCorp">↳</a></strong>', "↳"),
+    ])
+    sections = parse_sections(readme)
+    pm_key = next(k for k in sections if "product management" in k)
+    assert sections[pm_key] == []
 
 
 def test_parse_sections_swe_row_company():
@@ -176,9 +239,10 @@ def test_find_new_rows_returns_all_when_known_urls_empty():
 def test_find_new_rows_excludes_known_urls():
     sections = parse_sections(SAMPLE_README)
     rows = find_new_rows(sections, {"https://stripe.com/jobs/123"}, _TARGET)
-    companies = {r["company"] for r in rows}
-    assert "Stripe" not in companies
-    assert "PM Corp" in companies
+    urls = {r["url"] for r in rows}
+    assert "https://stripe.com/jobs/123" not in urls
+    assert "https://stripe.com/jobs/124" in urls
+    assert "https://pmcorp.com/apply" in urls
 
 
 def test_find_new_rows_excludes_non_target_sections():
@@ -205,11 +269,22 @@ def test_find_new_rows_ignores_utm_param_changes():
     # Store the bare URL (no query string) as if initialized before utm params were added
     known = {"https://stripe.com/jobs/123"}
     rows = find_new_rows(sections, known, _TARGET)
-    companies = {r["company"] for r in rows}
-    assert "Stripe" not in companies
+    urls = {r["url"] for r in rows}
+    assert "https://stripe.com/jobs/123" not in urls
 
 
-def test_url_key_strips_query_and_fragment():
+def test_url_key_strips_tracking_params_and_fragment():
     assert url_key("https://example.com/job?utm_source=Simplify&ref=x") == "https://example.com/job"
     assert url_key("https://example.com/job#section") == "https://example.com/job"
     assert url_key("https://example.com/job") == "https://example.com/job"
+
+
+def test_url_key_keeps_job_identifying_params():
+    # Greenhouse-embedded boards identify the posting only via gh_jid
+    assert url_key("https://stripe.com/jobs/search?gh_jid=8212508&utm_source=Simplify&ref=Simplify") \
+        == "https://stripe.com/jobs/search?gh_jid=8212508"
+    assert url_key("https://stripe.com/jobs/search?gh_jid=1") != url_key("https://stripe.com/jobs/search?gh_jid=2")
+
+
+def test_url_key_param_order_is_stable():
+    assert url_key("https://x.com/j?b=2&a=1") == url_key("https://x.com/j?a=1&b=2")

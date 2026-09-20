@@ -1,7 +1,14 @@
 import os
 import tempfile
 
-from src.state import read_known_urls, read_last_sha, write_known_urls, write_last_sha
+from src.state import (
+    read_known_urls,
+    read_last_sha,
+    read_state_version,
+    write_known_urls,
+    write_last_sha,
+    write_state_version,
+)
 
 
 def test_read_last_sha_returns_none_when_file_missing():
@@ -70,3 +77,14 @@ def test_write_known_urls_empty_set():
         write_known_urls(tmpdir, set())
         result = read_known_urls(tmpdir)
         assert result == set()
+
+
+def test_read_state_version_returns_zero_when_missing():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        assert read_state_version(tmpdir) == 0
+
+
+def test_write_and_read_state_version_roundtrip():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        write_state_version(tmpdir, 2)
+        assert read_state_version(tmpdir) == 2

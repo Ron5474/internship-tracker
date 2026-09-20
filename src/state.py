@@ -27,3 +27,17 @@ def write_known_urls(data_dir: str, urls: set[str]) -> None:
     path = Path(data_dir) / "known_urls.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(sorted(urls)))
+
+
+def read_state_version(data_dir: str) -> int:
+    path = Path(data_dir) / "state_version.txt"
+    if not path.exists():
+        return 0
+    value = path.read_text().strip()
+    return int(value) if value else 0
+
+
+def write_state_version(data_dir: str, version: int) -> None:
+    path = Path(data_dir) / "state_version.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(version))

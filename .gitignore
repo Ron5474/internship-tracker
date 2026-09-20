@@ -1,5 +1,6 @@
 .env
-data/last_sha.txt
+data/*
+!data/.gitkeep
 __pycache__/
 *.pyc
 .pytest_cache/
