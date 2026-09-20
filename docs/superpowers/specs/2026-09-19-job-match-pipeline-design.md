@@ -162,7 +162,7 @@ Every external call is classified before deciding what to do:
 | Transient | timeout, connection error, 5xx, 429 | Retry with exponential backoff (30 s → 1 min → 5 min → 15 min → 1 h), honoring `Retry-After` when present. Counts against the stage's budget. |
 | Service unavailable | LLM endpoint refuses connections or returns 401/403 | Pause that service: log at ERROR once, set `next_attempt_at` 15 min ahead on the affected row, **do not** increment `attempts`. Queued evaluations wait for the service to come back. |
 | Item invalid | LLM response fails schema validation (after the client's single in-call re-ask), PDF render throws on this input | Counts as one failed attempt against the stage budget. |
-| Item gone | ATS API 404 for this posting | Not an error for the stage: fall through to the next fetch strategy. |
+| Item gone | ATS API 404 for this posting | Treated as permanent for the fetch stage: an ATS API 404 means the posting is gone; the link-only fallback still notifies. |
 | Destination gone | Discord webhook returns 404 or 401 | Pause `discord:<user_id>` until restart (see Paused services). Does not count against delivery attempts. |
 
 Attempt accounting: one stage run = one attempt, whatever happens inside it. The LLM client's re-ask on a malformed response happens inside that single attempt and is not counted separately. Stage budgets below are in attempts.
@@ -188,13 +188,13 @@ Delivery failures never discard the PDF, the score or the outcome: the row keeps
    - Greenhouse: `boards.greenhouse.io/<board>/jobs/<id>` **and** `job-boards.greenhouse.io/<board>/jobs/<id>` (the latter is five times more common in the live feeds) → `boards-api.greenhouse.io/v1/boards/<board>/jobs/<id>`, field `content` (HTML-escaped; unescape and strip tags). Greenhouse embeds (`?gh_jid=<id>` on a company domain) → same API, board slug from the `boards.greenhouse.io` link or the page's embed script; if the board cannot be determined, fall through.
    - Lever: `jobs.lever.co/<company>/<uuid>` → `api.lever.co/v0/postings/<company>/<uuid>`; description is `descriptionPlain` plus each entry in `lists[]` (requirements often live only in the lists).
    - Ashby: `jobs.ashbyhq.com/<company>/<uuid>` → the public job-board API returns every posting for the board; select the one whose `jobUrl` contains the UUID. Field names verified against Ashby's public API docs during planning.
-   A 404 from any of these falls through to step 3.
+   A 404 from any of these is a permanent failure (the posting is closed); no page fetch is attempted.
 3. Otherwise plain GET and `trafilatura.extract()`. A result under 300 characters is treated as a failure (JavaScript shell page).
 4. Store the full extracted text. When handing it to the LLM, cap at 12,000 characters and set `description_truncated` if the cap applied.
 
 Politeness: one fetch at a time, 2 s pause between fetches, 15 s timeout, browser-like User-Agent.
 
-Every fetch logs one line with host and outcome. Before deciding on a headless browser, measure — for the subscribed sections only — how many fetched descriptions actually contain a requirements section, not merely non-empty text. Workday, Oracle Cloud, TikTok and SmartRecruiters together outnumber Greenhouse + Lever + Ashby in the live feeds; SmartRecruiters has a documented Posting API and is the first candidate for an additional handler.
+Every fetch logs one line with host and outcome. Before deciding on a headless browser, measure — for the subscribed sections only — how many fetched descriptions actually contain a requirements section, not merely non-empty text. Workday, Oracle Cloud, TikTok and SmartRecruiters together outnumber Greenhouse + Lever + Ashby in the live feeds; SmartRecruiters has a documented Posting API and is the first candidate for an additional handler. Workday `/details/<title>_<id>` links and Greenhouse `job_app?token=` embeds are not matched by the API handlers and take the page path; the per-host measurement will show whether they need handlers.
 
 ## Master CV schema
 
@@ -366,7 +366,7 @@ src/
 pytest, matching the existing test style (mocked `requests`, temp dirs, in-memory SQLite). Required coverage:
 
 - `parser`: fixture from the New-Grad README parses sections and rows (already in PR #1)
-- `fetcher`: each ATS handler with mocked responses, including `job-boards.greenhouse.io` and Lever `lists[]`; redirect resolution; ATS 404 falls through to plain GET; trafilatura fallback; short result treated as failure; truncation flag set at 12k
+- `fetcher`: each ATS handler with mocked responses, including `job-boards.greenhouse.io` and Lever `lists[]`; redirect resolution; ATS 404 is permanent; trafilatura fallback; short result treated as failure; truncation flag set at 12k
 - `llm`: mocked endpoint; valid JSON parsed; malformed JSON retried once then classed invalid; 401 classed service-unavailable; 429 with `Retry-After` classed transient with the given delay
 - `cv` validation: unknown entry dropped; bullet under wrong entry dropped; foreign skill dropped; education and summary untouched; bullet cap enforced; too-few-entries fallback
 - `render`: produces a valid PDF; entry caps applied; two-page output sets `page_overflow`
