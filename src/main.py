@@ -46,7 +46,10 @@ def poll_all(session_factory, users: list[User], settings: Settings) -> None:
 
 def _poll_loop(session_factory, users, settings) -> None:
     while True:
-        poll_all(session_factory, users, settings)
+        try:
+            poll_all(session_factory, users, settings)
+        except Exception:
+            log.exception("Poll cycle failed")
         time.sleep(settings.poll_interval)
 
 
