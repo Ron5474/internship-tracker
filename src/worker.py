@@ -60,7 +60,10 @@ class Worker:
 
     def _pause(self, name: str, until: datetime | None, why: str) -> None:
         if name not in self.paused:
-            log.error("Pausing %s (%s)%s", name, why, "" if until else " until restart")
+            if until is None:
+                log.error("Pausing %s (%s) until restart", name, why)
+            else:
+                log.error("Pausing %s (%s) until %s", name, why, until.isoformat(timespec="seconds"))
         self.paused[name] = until
 
     # -- loop ---------------------------------------------------------------
@@ -128,3 +131,7 @@ class Worker:
         level = logging.ERROR if ev.delivery_attempts > DELIVERY_BUDGET else logging.WARNING
         log.log(level, "Delivery to %s failed (attempt %d, %s): %s; retry in %ss",
                 ev.user_id, ev.delivery_attempts, result.kind, result.error, delay)
+        if result.kind == "transient":
+            # 5xx / connection / 429 says the destination is unwell: hold the user's other
+            # rows too. "invalid" is one bad request and says nothing about the webhook.
+            self._pause(f"discord:{ev.user_id}", ev.next_attempt_at, result.error or result.kind)

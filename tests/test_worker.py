@@ -154,6 +154,37 @@ def _seed_second_ron(session):
     return ev
 
 
+def test_transient_failure_pauses_user_until_retry_time(session_factory, session, clock):
+    # While one row backs off, the same user's other rows must not be attempted either.
+    ev1 = _seed(session, "ron")
+    ev2 = _seed_second_ron(session)
+    sender = FakeSender(DeliveryResult("transient", None, "503"), OK, OK)
+    w = _worker(session_factory, sender, clock)
+    w.run_once()
+    assert w.paused["discord:ron"] == T0 + timedelta(seconds=30)
+    assert w.run_once() is False
+    assert len(sender.calls) == 1
+    clock.advance(30)
+    assert w.run_once() is True
+    assert len(sender.calls) == 2
+    # Both rows are runnable now; the worker picks by next_attempt_at, so the row that
+    # never failed (still due at T0) goes before the retried one (due at T0+30s).
+    session.refresh(ev1); session.refresh(ev2)
+    assert ev2.stage == STAGE_CLOSED
+    assert ev1.stage == STAGE_DELIVER
+    assert w.run_once() is True
+    session.refresh(ev1)
+    assert ev1.stage == STAGE_CLOSED
+    assert ev1.delivery_attempts == 2
+
+
+def test_invalid_result_does_not_pause_user(session_factory, session, clock):
+    _seed(session)
+    w = _worker(session_factory, FakeSender(DeliveryResult("invalid", None, "HTTP 400: bad")), clock)
+    w.run_once()
+    assert "discord:ron" not in w.paused
+
+
 def test_invalid_request_counts_attempt_and_backs_off(session_factory, session, clock):
     ev = _seed(session)
     w = _worker(session_factory, FakeSender(DeliveryResult("invalid", None, "HTTP 400: bad")), clock)
