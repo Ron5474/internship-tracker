@@ -1,0 +1,6 @@
+- id: ron
+  cv: /data/cvs/ron.yaml
+  discord_webhook: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+  feeds: [internships, new-grad]
+  sections: [software engineering, data science]
+  threshold: 60
