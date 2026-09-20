@@ -12,6 +12,7 @@ log = logging.getLogger(__name__)
 MIN_DESCRIPTION_CHARS = 300
 DESCRIPTION_CAP = 12000
 FETCH_TIMEOUT = 15
+MAX_PAGE_CHARS = 2_000_000
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
 )
@@ -211,12 +212,18 @@ def fetch_description(url: str) -> FetchResult:
     if matched:
         return fetch_via_api(*matched)
 
+    # Only parse HTML: a PDF or JSON body is not a job page. A missing header is treated as HTML.
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if ctype and not ctype.startswith(("text/html", "application/xhtml")):
+        return FetchResult(None, final_host, "none", "permanent", f"not HTML ({ctype.split(';')[0]})")
+    html = (resp.text or "")[:MAX_PAGE_CHARS]
+
     jid = _GH_JID.search(final_url) or _GH_JID.search(url)
-    board = _GH_EMBED_BOARD.search(resp.text or "")
+    board = _GH_EMBED_BOARD.search(html)
     if jid and board:
         return _greenhouse(board.group(1), jid.group(1), strategy="greenhouse-embed")
 
-    extracted = trafilatura.extract(resp.text or "", include_comments=False, include_tables=True)
+    extracted = trafilatura.extract(html, include_comments=False, include_tables=True)
     if not extracted:
         return FetchResult(None, final_host, "page", "permanent", "no extractable text")
     return _finish(extracted, final_host, "page")

@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 import requests
 
 from fetcher import (
+    MAX_PAGE_CHARS,
     MIN_DESCRIPTION_CHARS,
     FetchResult,
     classify_status,
@@ -269,9 +270,10 @@ def test_workday_handler_null_description_is_permanent_too_short():
 PAGE_HTML = "<html><body><main><h1>Software Engineer</h1><h2>Qualifications</h2><p>" + LONG + "</p></main></body></html>"
 
 
-def _page(status=200, text=PAGE_HTML, url="https://careers.example.com/job/1"):
+def _page(status=200, text=PAGE_HTML, url="https://careers.example.com/job/1", headers=None):
     r = _resp(status, None, text)
     r.url = url
+    r.headers = {"Content-Type": "text/html; charset=utf-8"} if headers is None else headers
     return r
 
 
@@ -345,3 +347,26 @@ def test_fetch_description_greenhouse_embed_without_board_falls_back_to_page():
          patch("fetcher.trafilatura.extract", return_value="Qualifications\n" + LONG):
         r = fetch_description("https://stripe.com/jobs/search?gh_jid=8212508")
     assert r.ok and r.strategy == "page"
+
+
+def test_fetch_description_rejects_non_html_content_type():
+    with patch("fetcher.requests.get", return_value=_page(headers={"Content-Type": "application/pdf"})), \
+         patch("fetcher.trafilatura.extract") as extract:
+        r = fetch_description("https://careers.example.com/job/1.pdf")
+    assert r.kind == "permanent" and r.strategy == "none"
+    assert r.error == "not HTML (application/pdf)"
+    extract.assert_not_called()
+
+
+def test_fetch_description_missing_content_type_is_treated_as_html():
+    with patch("fetcher.requests.get", return_value=_page(headers={})), \
+         patch("fetcher.trafilatura.extract", return_value="Qualifications\n" + LONG):
+        r = fetch_description("https://careers.example.com/job/1")
+    assert r.ok
+
+
+def test_fetch_description_caps_page_size():
+    with patch("fetcher.requests.get", return_value=_page(text="x" * (MAX_PAGE_CHARS + 100))), \
+         patch("fetcher.trafilatura.extract", return_value="Qualifications\n" + LONG) as extract:
+        fetch_description("https://careers.example.com/job/1")
+    assert len(extract.call_args.args[0]) == MAX_PAGE_CHARS
