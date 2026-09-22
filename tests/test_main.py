@@ -55,7 +55,7 @@ def test_poll_loop_survives_exception_and_continues(monkeypatch):
 # --- end to end: build → poll → poll → deliver --------------------------------
 
 def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok")
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
     users = [RON]
     session_factory, worker = main.build(settings, users)
 
@@ -94,7 +94,7 @@ def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
 
 def test_poll_fetch_deliver_end_to_end(tmp_path):
     from fetcher import FetchResult
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok")
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
     users = [User(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"],
                   sections=["software engineering"])]
     session_factory, worker = main.build(settings, users)
@@ -126,7 +126,7 @@ def test_poll_fetch_deliver_end_to_end(tmp_path):
 def test_build_imports_legacy_state(tmp_path):
     state.write_known_urls(str(tmp_path), {"https://a.com/1", "https://b.com/2"})
     state.write_last_sha(str(tmp_path), "abc1234")
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token=None)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token=None, llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
 
     session_factory, _worker = main.build(settings, [RON])
 

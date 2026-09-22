@@ -13,6 +13,7 @@ class User(BaseModel):
     feeds: list[str] = Field(min_length=1)
     sections: list[str] = Field(min_length=1)
     threshold: int = 60
+    notify_below_threshold: bool = False
 
     @field_validator("feeds")
     @classmethod

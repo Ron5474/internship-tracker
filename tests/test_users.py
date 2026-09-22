@@ -79,3 +79,12 @@ def test_missing_webhook_rejected():
 def test_empty_file_rejected():
     with pytest.raises(ValueError, match="no users"):
         load_users(_write(""))
+
+
+def test_notify_below_threshold_defaults_false():
+    assert load_users(_write(VALID))[0].notify_below_threshold is False
+
+
+def test_notify_below_threshold_parsed():
+    text = VALID.replace("  threshold: 60\n", "  threshold: 60\n  notify_below_threshold: true\n")
+    assert load_users(_write(text))[0].notify_below_threshold is True
