@@ -133,6 +133,11 @@ class Worker:
 
     def fetch(self, session: Session, job: Job) -> None:
         now = self._now()
+        if job.fetch_attempts >= FETCH_BUDGET:
+            # Crashed attempts can leave the job at the budget while still pending: no more requests.
+            job.fetch_error = f"budget exhausted after {job.fetch_attempts} attempts"
+            self._fail_fetch(session, job)
+            return
         if job.fetch_first_attempt_at is None:
             job.fetch_first_attempt_at = now
         job.fetch_attempts += 1
@@ -145,7 +150,8 @@ class Worker:
         except Exception as e:  # noqa: BLE001 — a fetcher bug is a failed attempt, not a dead worker
             log.exception("Fetcher raised for job %d", job.id)
             result = FetchResult(None, job.fetch_host or "", "none", "transient", f"{type(e).__name__}: {e}")
-        self._fetch_not_before = self._now() + timedelta(seconds=FETCH_GAP_SECONDS)
+        after = self._now()   # a fetch can take the full timeout; deadlines count from when it returned
+        self._fetch_not_before = after + timedelta(seconds=FETCH_GAP_SECONDS)
 
         job.fetch_host = result.host
         job.fetch_strategy = result.strategy
@@ -164,14 +170,14 @@ class Worker:
             return
 
         job.fetch_error = result.error
-        age = now - job.fetch_first_attempt_at
+        age = after - job.fetch_first_attempt_at
         over_budget = job.fetch_attempts >= FETCH_BUDGET or age >= timedelta(hours=FETCH_MAX_AGE_HOURS)
         if result.kind == "permanent" or over_budget:
             if result.kind != "permanent":
                 job.fetch_error = f"budget exhausted after {job.fetch_attempts} attempts: {result.error}"
             self._fail_fetch(session, job)
             return
-        job.next_attempt_at = now + timedelta(seconds=backoff(job.fetch_attempts))
+        job.next_attempt_at = after + timedelta(seconds=backoff(job.fetch_attempts))
 
     def _fail_fetch(self, session: Session, job: Job) -> None:
         job.fetch_status = FETCH_FAILED

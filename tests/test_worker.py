@@ -488,3 +488,31 @@ def test_fail_fetch_stamps_only_open_evaluations_without_outcome(session_factory
     assert ev_ron.outcome == "fetch_failed"
     assert ev_cousin.outcome == "score_failed"           # pre-set outcome untouched
     assert ev_ghost.outcome is None and ev_ghost.stage == STAGE_CLOSED
+
+
+def test_fetch_over_budget_on_restart_fails_without_a_request(session_factory, session, clock):
+    # Crashes can leave attempts == budget with the job still pending; no further request.
+    ev = _seed(session)
+    ev.job.fetch_attempts = FETCH_BUDGET
+    ev.job.fetch_first_attempt_at = T0
+    session.commit()
+    fetcher = FakeFetcher(FETCH_OK_RESULT)
+    w = _worker_f(session_factory, fetcher, clock)
+    assert w.run_once() is True
+    assert fetcher.calls == []
+    session.refresh(ev); session.refresh(ev.job)
+    assert ev.job.fetch_status == FETCH_FAILED and "budget" in ev.job.fetch_error
+    assert ev.outcome == "fetch_failed"
+
+
+def test_fetch_backoff_is_measured_from_after_the_call(session_factory, session, clock):
+    ev = _seed(session)
+
+    def slow(url):
+        clock.advance(14)                     # a near-timeout fetch
+        return FETCH_TRANSIENT
+
+    w = _worker_f(session_factory, slow, clock)
+    w.run_once()
+    session.refresh(ev.job)
+    assert ev.job.next_attempt_at == T0 + timedelta(seconds=14 + 30)
