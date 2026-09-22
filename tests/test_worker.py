@@ -84,6 +84,22 @@ def test_message_for_fetch_failed_adds_note(session):
     assert "(couldn't read the description)" in message_for(ev)
 
 
+def test_message_for_matched_row_uses_match_format(session):
+    ev = _seed(session, outcome="matched", score=82, reasoning="Good.", missing_confirmed=["K8s"], missing_unknown=[])
+    msg = message_for(ev)
+    assert msg.startswith("🎯 82% — **Stripe** — SWE Intern") and "⚠️ Gaps: K8s" in msg
+
+
+def test_message_for_below_threshold_row_uses_down_icon(session):
+    ev = _seed(session, outcome="below_threshold", score=40, reasoning="Meh.")
+    assert message_for(ev).startswith("📉 40% — **Stripe**")
+
+
+def test_message_for_score_failed_is_link_only_with_note(session):
+    ev = _seed(session, outcome="score_failed")
+    assert "(couldn't score)" in message_for(ev) and "🎯" not in message_for(ev)
+
+
 # --- deliver ---------------------------------------------------------------
 
 def test_run_once_delivers_and_closes(session_factory, session, clock):

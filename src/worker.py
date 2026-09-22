@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session, sessionmaker
 
 from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, STAGE_SCORE, Evaluation, Job, utcnow
-from discord_client import DeliveryResult, format_link_only, send_message
+from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from users import User
 
@@ -20,7 +20,7 @@ FETCH_GAP_SECONDS = 2
 
 _LINK_ONLY_NOTES = {
     "fetch_failed": "couldn't read the description",
-    "score_failed": "couldn't read the description",
+    "score_failed": "couldn't score",
 }
 
 
@@ -31,6 +31,9 @@ def backoff(attempt: int) -> int:
 
 def message_for(ev: Evaluation) -> str:
     job = ev.job
+    if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
+        return format_match(job.company, job.role, job.location, job.url, ev.score, ev.reasoning or "",
+                            ev.missing_confirmed or [], ev.missing_unknown or [], matched=ev.outcome == "matched")
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
 
