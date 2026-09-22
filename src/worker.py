@@ -299,7 +299,7 @@ class Worker:
         log.warning("Evaluation %d: scoring gave up after %d attempts: %s", ev.id, ev.attempts, why)
 
     def _llm_model_name(self) -> str:
-        return getattr(self._llm, "_model", "?")
+        return getattr(self._llm, "model", "?")
 
     @staticmethod
     def _score_outcome(result: LLMResult, user: User) -> str:

@@ -47,6 +47,7 @@ def test_user_message_contains_both_inputs_in_order():
 def test_classify_status():
     assert classify_status(200) == "ok"
     assert classify_status(429) == "transient" and classify_status(503) == "transient"
+    assert classify_status(408) == "transient"
     assert classify_status(401) == "unavailable" and classify_status(403) == "unavailable" and classify_status(404) == "unavailable"
     assert classify_status(400) == "invalid" and classify_status(422) == "invalid"
 
@@ -110,6 +111,28 @@ def test_score_reasks_once_on_invalid_json_then_succeeds():
     msgs = post.call_args.kwargs["json"]["messages"]
     assert msgs[-2] == {"role": "assistant", "content": "not json at all"}
     assert msgs[-1]["role"] == "user" and "JSON" in msgs[-1]["content"]
+
+
+def test_reask_message_includes_validation_error():
+    # The re-ask names the failing field so the model can fix that, not guess.
+    with patch("llm.requests.post", side_effect=[_resp(200, {**GOOD, "score": 82.0}), _resp(200, GOOD)]) as post:
+        r = _client().score("JD", "CV")
+    assert r.ok and post.call_count == 2
+    reask = post.call_args.kwargs["json"]["messages"][-1]
+    assert reask["role"] == "user" and "score" in reask["content"]
+
+
+def test_score_usage_sums_both_calls_on_reask():
+    first = _resp(200, "not json", usage={"prompt_tokens": 100, "completion_tokens": 10})
+    second = _resp(200, GOOD, usage={"prompt_tokens": 120, "completion_tokens": 30})
+    with patch("llm.requests.post", side_effect=[first, second]):
+        r = _client().score("JD", "CV")
+    assert r.ok
+    assert r.usage == {"prompt_tokens": 220, "completion_tokens": 40}
+
+
+def test_client_exposes_model_name():
+    assert _client().model == "deepseek-v4-flash"
 
 
 def test_score_invalid_after_reask_is_invalid():

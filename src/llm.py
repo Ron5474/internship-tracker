@@ -1,5 +1,4 @@
 import json
-import logging
 import re
 import time
 from dataclasses import dataclass
@@ -8,8 +7,6 @@ import requests
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from prompts import SCORE_SYSTEM, reask_message, score_user_message
-
-log = logging.getLogger(__name__)
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
@@ -43,11 +40,25 @@ class LLMResult:
 def classify_status(status: int) -> str:
     if 200 <= status < 300:
         return "ok"
-    if status == 429 or status >= 500:
+    if status in (408, 429) or status >= 500:
         return "transient"
     if status in (401, 403, 404):
         return "unavailable"   # bad key, blocked, or unknown model: config, not this item
     return "invalid"
+
+
+def _sum_usage(a: dict | None, b: dict | None) -> dict | None:
+    """Token usage across both requests of a re-ask: the second call is billed too.
+    Numeric counters (prompt/completion/total) are summed, a key missing on one side counts as 0;
+    non-numeric extras (nested *_details) are dropped rather than guessed at."""
+    if not a or not b:
+        return a or b
+    out = {}
+    for k in sorted(a.keys() | b.keys()):
+        x, y = a.get(k), b.get(k)
+        if isinstance(x, (int, float)) or isinstance(y, (int, float)):
+            out[k] = (x if isinstance(x, (int, float)) else 0) + (y if isinstance(y, (int, float)) else 0)
+    return out
 
 
 def _strip_fence(text: str) -> str:
@@ -80,6 +91,10 @@ class LLMClient:
 
     # -- public -------------------------------------------------------------
 
+    @property
+    def model(self) -> str:
+        return self._model
+
     def score(self, description: str, cv_text: str) -> LLMResult:
         messages = [
             {"role": "system", "content": SCORE_SYSTEM},
@@ -90,10 +105,10 @@ class LLMClient:
         if kind == "ok":
             parsed, perr = self._parse(content)
             if parsed is None:
-                # One re-ask, carrying the bad reply so the model sees what it did.
-                messages += [{"role": "assistant", "content": content}, {"role": "user", "content": reask_message()}]
+                # One re-ask, carrying the bad reply and what was wrong with it.
+                messages += [{"role": "assistant", "content": content}, {"role": "user", "content": reask_message(perr)}]
                 kind, content, error, retry_after, model2, usage2 = self._chat(messages)
-                model, usage = model2 or model, usage2 or usage
+                model, usage = model2 or model, _sum_usage(usage, usage2)
                 if kind == "ok":
                     parsed, perr = self._parse(content)
                     if parsed is None:

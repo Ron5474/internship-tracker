@@ -27,15 +27,10 @@ Reply with ONLY a JSON object, no prose, no code fences:
 Keep each list item under 12 words. Empty lists are fine.
 """
 
-_REASK = (
-    "That reply was not a valid JSON object matching the schema. "
-    "Reply again with ONLY the JSON object — no prose, no code fences."
-)
-
-
 def score_user_message(description: str, cv_text: str) -> str:
     return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}"
 
 
-def reask_message() -> str:
-    return _REASK
+def reask_message(problem: str) -> str:
+    return (f"That reply was not a valid JSON object matching the schema ({problem}). "
+            "Reply again with ONLY the JSON object — no prose, no code fences.")
