@@ -6,7 +6,7 @@ import pytest
 import main
 import state
 from config import FEEDS, Settings
-from db import STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
+from db import FETCH_OK, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
 from tests.test_poller import README_V1, README_V2
 from users import User
 
@@ -77,6 +77,10 @@ def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
         assert ev.stage == STAGE_DELIVER
         assert ev.user_id == "ron"
         ev_id = ev.id
+        # Delivery is gated on the description fetch; resolve it here so this test
+        # keeps exercising poll → deliver without touching the network.
+        ev.job.fetch_status = FETCH_OK
+        session.commit()
 
     # Worker delivers it through the real discord_client.
     ok = Mock(status_code=200, headers={}, json=lambda: {"id": "1"})
@@ -86,6 +90,37 @@ def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
     assert post.call_args.kwargs["params"] == {"wait": "true"}
     with session_factory() as session:
         assert session.get(Evaluation, ev_id).stage == STAGE_CLOSED
+
+
+def test_poll_fetch_deliver_end_to_end(tmp_path):
+    from fetcher import FetchResult
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok")
+    users = [User(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"],
+                  sections=["software engineering"])]
+    session_factory, worker = main.build(settings, users)
+    worker._fetch = lambda url: FetchResult("Qualifications\n" + "z" * 400, "api.lever.co", "lever", "ok", None)
+
+    with patch("main.get_latest_sha", return_value="s1"), \
+         patch("main.get_readme_content", side_effect=lambda repo, sha, token=None: README_V1 if "Internships" in repo else ""):
+        main.poll_all(session_factory, users, settings)
+    with patch("main.get_latest_sha", return_value="s2"), \
+         patch("main.get_readme_content", side_effect=lambda repo, sha, token=None: README_V2 if "Internships" in repo else ""):
+        main.poll_all(session_factory, users, settings)
+
+    post = Mock(return_value=Mock(status_code=200, headers={}, json=lambda: {"id": "1"}))
+    with patch("discord_client.requests.post", post):
+        assert worker.run_once() is True      # fetch
+        assert post.call_count == 0
+        worker._fetch_not_before = None       # skip the politeness gap
+        assert worker.run_once() is True      # deliver
+    assert post.call_count == 1
+
+    with session_factory() as s:
+        ev = s.query(Evaluation).one()
+        assert ev.stage == "closed"
+        assert ev.job.fetch_status == "ok"
+        assert ev.job.fetch_strategy == "lever"
+        assert ev.job.has_requirements is True
 
 
 def test_build_imports_legacy_state(tmp_path):

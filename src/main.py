@@ -7,7 +7,7 @@ import time
 from dotenv import load_dotenv
 
 from config import FEEDS, Settings, load_settings
-from db import ensure_feeds, import_legacy_state, init_db, make_engine, make_session_factory
+from db import ensure_columns, ensure_feeds, import_legacy_state, init_db, make_engine, make_session_factory
 from github_client import get_latest_sha, get_readme_content
 from migration import migrate_state
 from poller import poll_feed
@@ -23,6 +23,9 @@ log = logging.getLogger("main")
 def build(settings: Settings, users: list[User]):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
+    added = ensure_columns(engine)
+    if added:
+        log.info("Schema upgraded: added %s", ", ".join(added))
     session_factory = make_session_factory(engine)
     with session_factory() as session:
         ensure_feeds(session, FEEDS.values())
