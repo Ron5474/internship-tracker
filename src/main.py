@@ -22,7 +22,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("main")
 
 
-def build(settings: Settings, users: list[User], llm=None):
+def load_cvs(users: list[User]) -> dict[str, dict]:
+    """Every user's CV, parsed; fails fast naming the bad file."""
+    return {u.id: load_cv(u.cv).model_dump() for u in users}
+
+
+def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] | None = None):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
     added = ensure_columns(engine)
@@ -36,7 +41,8 @@ def build(settings: Settings, users: list[User], llm=None):
     if seeded:
         log.info("Imported %d jobs from legacy known_urls.json", seeded)
 
-    cvs = {u.id: load_cv(u.cv).model_dump() for u in users}   # fails fast naming the bad file
+    if cvs is None:
+        cvs = load_cvs(users)
     if llm is None:
         llm = LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_score_model, settings.llm_timeout)
     log.info("Scoring with %s at %s", settings.llm_score_model, settings.llm_base_url)
@@ -66,6 +72,7 @@ def _poll_loop(session_factory, users, settings) -> None:
 def main() -> None:
     settings = load_settings(os.environ)
     users = load_users(os.path.join(settings.data_dir, "users.yaml"))
+    cvs = load_cvs(users)   # before the migration loop below, which retries GitHub forever
     log.info("Tracker starting: %d users, feeds %s, interval %ds",
              len(users), list(FEEDS), settings.poll_interval)
 
@@ -76,7 +83,7 @@ def main() -> None:
         log.error("State migration failed; retrying in 60s")
         time.sleep(60)
 
-    session_factory, worker = build(settings, users)
+    session_factory, worker = build(settings, users, cvs=cvs)
 
     threading.Thread(target=_poll_loop, args=(session_factory, users, settings), name="poller", daemon=True).start()
     worker.run_forever()

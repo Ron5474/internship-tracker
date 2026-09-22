@@ -6,7 +6,7 @@ import pytest
 import main
 import state
 from config import FEEDS, Settings
-from db import FETCH_OK, STAGE_CLOSED, STAGE_DELIVER, STAGE_SCORE, Evaluation, Feed, Job
+from db import FETCH_OK, STAGE_CLOSED, STAGE_SCORE, Evaluation, Feed, Job
 from llm import LLMResult, ScoreResponse
 from tests.test_poller import README_V1, README_V2
 from users import User
@@ -152,6 +152,21 @@ def test_build_fails_fast_on_missing_cv(tmp_path):
                   feeds=["internships"], sections=["software engineering"])]
     with pytest.raises(ValueError, match="missing.yaml"):
         main.build(settings, users, llm=FakeLLM())
+
+
+def test_main_loads_cvs_before_migration(monkeypatch, tmp_path):
+    # A missing CV must stop startup before the migration loop, which retries GitHub forever.
+    (tmp_path / "users.yaml").write_text(
+        f"- id: ron\n  cv: {tmp_path / 'missing.yaml'}\n  discord_webhook: https://d/ron\n"
+        "  feeds: [internships]\n  sections: [software engineering]\n")
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("LLM_BASE_URL", "http://llm")
+    monkeypatch.setenv("LLM_SCORE_MODEL", "m")
+    migrate = Mock(return_value=True)
+    monkeypatch.setattr(main, "migrate_state", migrate)
+    with pytest.raises(ValueError, match="missing"):
+        main.main()
+    migrate.assert_not_called()
 
 
 def test_below_threshold_end_to_end_closes_without_post(tmp_path):
