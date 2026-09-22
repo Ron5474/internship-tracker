@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Job, utcnow
+from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, STAGE_SCORE, Evaluation, Job, utcnow
 from discord_client import DeliveryResult, format_link_only, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from users import User
@@ -182,8 +182,12 @@ class Worker:
     def _fail_fetch(self, session: Session, job: Job) -> None:
         job.fetch_status = FETCH_FAILED
         for ev in job.evaluations:
-            if ev.stage != STAGE_CLOSED and ev.outcome is None:
+            if ev.stage == STAGE_CLOSED:
+                continue
+            if ev.outcome is None:
                 ev.outcome = "fetch_failed"
+            if ev.stage == STAGE_SCORE:
+                ev.stage = STAGE_DELIVER   # nothing to score; deliver the link
         log.warning("Job %d (%s — %s) description unavailable: %s", job.id, job.company, job.role, job.fetch_error)
 
     # -- deliver stage ------------------------------------------------------

@@ -42,7 +42,7 @@ def _seed(session, user_id="ron", **ev_kwargs):
               company="Stripe", role="SWE Intern", location="SF", section="software engineering internship roles",
               next_attempt_at=T0)
     # Pin next_attempt_at to the fake clock; the model default is the real utcnow().
-    ev = Evaluation(job=job, user_id=user_id, **{"next_attempt_at": T0, **ev_kwargs})
+    ev = Evaluation(job=job, user_id=user_id, **{"next_attempt_at": T0, "stage": STAGE_DELIVER, **ev_kwargs})
     session.add_all([feed, job, ev])
     session.commit()
     return ev
@@ -167,7 +167,7 @@ def _seed_second_ron(session):
     job = Job(feed=feed, url_key="https://x.com/ron2", url="https://x.com/ron2", company="Meta",
               role="SWE Intern", location="MP", section="software engineering internship roles",
               next_attempt_at=T0)
-    ev = Evaluation(job=job, user_id="ron", next_attempt_at=T0)
+    ev = Evaluation(job=job, user_id="ron", next_attempt_at=T0, stage=STAGE_DELIVER)
     session.add_all([job, ev]); session.commit()
     return _resolve(session, ev)
 
@@ -516,3 +516,15 @@ def test_fetch_backoff_is_measured_from_after_the_call(session_factory, session,
     w.run_once()
     session.refresh(ev.job)
     assert ev.job.next_attempt_at == T0 + timedelta(seconds=14 + 30)
+
+
+from db import STAGE_SCORE
+
+
+def test_fail_fetch_moves_score_rows_to_deliver(session_factory, session, clock):
+    ev = _seed(session, stage=STAGE_SCORE)
+    w = _worker_f(session_factory, FakeFetcher(FETCH_PERMANENT), clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.outcome == "fetch_failed"
+    assert ev.stage == STAGE_DELIVER

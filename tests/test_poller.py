@@ -1,7 +1,7 @@
 import pytest
 
 from config import FeedSpec
-from db import Evaluation, Feed, Job, ensure_feeds, STAGE_DELIVER
+from db import Evaluation, Feed, Job, ensure_feeds, STAGE_SCORE
 from poller import poll_feed
 from users import User
 
@@ -74,7 +74,7 @@ def test_new_row_creates_job_and_evaluation_for_matching_user(db):
     assert result.evaluations_added == 1
     ev = db.query(Evaluation).one()
     assert ev.user_id == "ron"           # cousin is not subscribed to internships
-    assert ev.stage == STAGE_DELIVER
+    assert ev.stage == STAGE_SCORE
     assert ev.job.url_key == "https://stripe.com/j?gh_jid=2"
     assert ev.job.company == "Stripe"    # ↳ row inherited the company
     assert ev.job.section == "software engineering internship roles"
