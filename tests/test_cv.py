@@ -52,6 +52,11 @@ def test_missing_file_raises_value_error_with_path(tmp_path):
         load_cv(str(tmp_path / "nope.yaml"))
 
 
+def test_directory_path_raises_value_error_with_path(tmp_path):
+    with pytest.raises(ValueError, match=str(tmp_path)):
+        load_cv(str(tmp_path))
+
+
 def test_invalid_schema_raises_value_error_with_path(tmp_path):
     p = tmp_path / "bad.yaml"
     p.write_text("name: X\n")

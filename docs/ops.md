@@ -47,3 +47,36 @@ UPDATE evaluations SET outcome=NULL WHERE job_id = <job id> AND stage != 'closed
 ```
 
 The worker only fetches jobs that still have an open (non-`closed`) evaluation. If the job's evaluations were already delivered, the reset has no effect.
+
+## Scoring
+
+Per-attempt log line: `score ev=<id> user=<id> model=<m> outcome=<matched|below_threshold|transient|unavailable|invalid> score=<n|-> ms=<t> tokens=<in>/<out>`.
+
+Score distribution and outcomes (last 7 days):
+
+```sql
+SELECT user_id, outcome, COUNT(*) AS n, ROUND(AVG(score),1) AS avg_score, MIN(score), MAX(score)
+FROM evaluations
+WHERE updated_at >= datetime('now', '-7 days') AND score IS NOT NULL
+GROUP BY 1, 2;
+```
+
+Token spend by model:
+
+```sql
+SELECT score_model, COUNT(*) AS calls,
+       SUM(json_extract(score_usage, '$.prompt_tokens'))     AS prompt_tokens,
+       SUM(json_extract(score_usage, '$.completion_tokens')) AS completion_tokens
+FROM evaluations WHERE score_usage IS NOT NULL GROUP BY 1;
+```
+
+### Calibration week
+
+Set `notify_below_threshold: true` for yourself in `users.yaml` and restart. Every scored posting arrives with 🎯 (≥ threshold) or 📉 (below). Read a week of them; when a 📉 should have been a 🎯 or vice versa, note the evaluation id from the log line and the score. Adjust the rubric in `src/prompts.py` or your `threshold`, then set `notify_below_threshold: false`.
+
+Re-score one evaluation by hand (e.g. after a prompt change):
+
+```sql
+UPDATE evaluations SET stage='score', outcome=NULL, score=NULL, attempts=0, next_attempt_at=datetime('now')
+WHERE id = <evaluation id>;
+```

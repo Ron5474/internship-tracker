@@ -92,7 +92,7 @@ def load_cv(path: str) -> MasterCV:
     try:
         raw = yaml.safe_load(p.read_text()) or {}
         return MasterCV.model_validate(raw)
-    except (yaml.YAMLError, ValidationError) as e:
+    except (OSError, yaml.YAMLError, ValidationError) as e:
         raise ValueError(f"{path}: {e}") from e
 
 

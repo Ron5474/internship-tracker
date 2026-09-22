@@ -7,8 +7,10 @@ import time
 from dotenv import load_dotenv
 
 from config import FEEDS, Settings, load_settings
+from cv import load_cv
 from db import ensure_columns, ensure_feeds, import_legacy_state, init_db, make_engine, make_session_factory
 from github_client import get_latest_sha, get_readme_content
+from llm import LLMClient
 from migration import migrate_state
 from poller import poll_feed
 from users import User, load_users
@@ -20,7 +22,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("main")
 
 
-def build(settings: Settings, users: list[User]):
+def build(settings: Settings, users: list[User], llm=None):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
     added = ensure_columns(engine)
@@ -33,7 +35,12 @@ def build(settings: Settings, users: list[User]):
         session.commit()
     if seeded:
         log.info("Imported %d jobs from legacy known_urls.json", seeded)
-    return session_factory, Worker(session_factory, users)
+
+    cvs = {u.id: load_cv(u.cv).model_dump() for u in users}   # fails fast naming the bad file
+    if llm is None:
+        llm = LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_score_model, settings.llm_timeout)
+    log.info("Scoring with %s at %s", settings.llm_score_model, settings.llm_base_url)
+    return session_factory, Worker(session_factory, users, cvs=cvs, llm=llm)
 
 
 def poll_all(session_factory, users: list[User], settings: Settings) -> None:
