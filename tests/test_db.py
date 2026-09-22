@@ -202,9 +202,6 @@ def test_ensure_columns_refuses_non_nullable_column(tmp_path):
         ensure_columns(engine, metadata=ProbeBase.metadata)
 
 
-from db import STAGE_SCORE
-
-
 def test_evaluation_defaults_to_score_stage_with_score_columns(session):
     feed = Feed(name="internships", repo="a/b", branch="dev")
     job = _job(feed)

@@ -478,16 +478,21 @@ def test_fetch_lease_survives_crash_mid_fetch(session_factory, session, clock):
 
 def test_fail_fetch_stamps_only_open_evaluations_without_outcome(session_factory, session, clock):
     ev_ron = _seed(session, "ron")
-    ev_cousin = Evaluation(job=ev_ron.job, user_id="cousin", next_attempt_at=T0, outcome="score_failed")
+    ev_cousin = Evaluation(job=ev_ron.job, user_id="cousin", next_attempt_at=T0,
+                            stage=STAGE_DELIVER, outcome="score_failed")
     ev_ghost = Evaluation(job=ev_ron.job, user_id="ghost", next_attempt_at=T0, stage=STAGE_CLOSED)
-    session.add_all([ev_cousin, ev_ghost]); session.commit()
+    ev_dana = Evaluation(job=ev_ron.job, user_id="dana", next_attempt_at=T0,
+                          stage=STAGE_SCORE, outcome="score_failed")
+    session.add_all([ev_cousin, ev_ghost, ev_dana]); session.commit()
 
     w = _worker_f(session_factory, FakeFetcher(FETCH_PERMANENT), clock)
     assert w.run_once() is True
-    session.refresh(ev_ron); session.refresh(ev_cousin); session.refresh(ev_ghost)
+    session.refresh(ev_ron); session.refresh(ev_cousin); session.refresh(ev_ghost); session.refresh(ev_dana)
     assert ev_ron.outcome == "fetch_failed"
-    assert ev_cousin.outcome == "score_failed"           # pre-set outcome untouched
+    assert ev_cousin.stage == STAGE_DELIVER and ev_cousin.outcome == "score_failed"   # pre-set outcome untouched
     assert ev_ghost.outcome is None and ev_ghost.stage == STAGE_CLOSED
+    # A pre-set outcome does not block the score → deliver move.
+    assert ev_dana.stage == STAGE_DELIVER and ev_dana.outcome == "score_failed"
 
 
 def test_fetch_over_budget_on_restart_fails_without_a_request(session_factory, session, clock):
