@@ -20,6 +20,7 @@ class ScoreResponse(BaseModel):
     reasoning: str
     missing_confirmed: list[str]
     missing_unknown: list[str]
+    posting_usable: bool = True   # false: the text was not a job posting (login wall, error page, ...)
 
 
 @dataclass(frozen=True)

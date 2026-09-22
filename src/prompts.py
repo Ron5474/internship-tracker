@@ -17,12 +17,16 @@ Rubric (use the whole range; be consistent across postings):
 years of professional experience and the CV shows internships only), not merely that the CV
 is silent on it.
 
+If the text is not a job posting (an error page, login wall, cookie banner, navigation only,
+or a list of unrelated jobs), set `posting_usable` to false, `score` to 0 and leave the lists empty.
+
 Reply with ONLY a JSON object, no prose, no code fences:
 {
   "score": <integer 0-100>,
   "reasoning": "<two or three sentences on the strongest evidence for and against>",
   "missing_confirmed": ["<requirement the CV clearly does not meet>", ...],
-  "missing_unknown": ["<requirement the CV does not mention either way>", ...]
+  "missing_unknown": ["<requirement the CV does not mention either way>", ...],
+  "posting_usable": <true|false>
 }
 Keep each list item under 12 words. Empty lists are fine.
 """

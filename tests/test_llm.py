@@ -98,6 +98,24 @@ def test_score_requires_reasoning_and_gap_fields():
             assert _client().score("JD", "CV").kind == "invalid", missing
 
 
+def test_score_parses_posting_usable_false():
+    body = {"score": 0, "reasoning": "Not a posting.", "missing_confirmed": [], "missing_unknown": [], "posting_usable": False}
+    with patch("llm.requests.post", return_value=_resp(200, body)):
+        r = _client().score("JD", "CV")
+    assert r.ok and r.data.posting_usable is False
+
+
+def test_score_posting_usable_defaults_true():
+    with patch("llm.requests.post", return_value=_resp(200, GOOD)):
+        assert _client().score("JD", "CV").data.posting_usable is True
+
+
+def test_score_posting_usable_must_be_a_json_boolean():
+    for bad in ["false", 0, None]:
+        with patch("llm.requests.post", side_effect=[_resp(200, {**GOOD, "posting_usable": bad})] * 2):
+            assert _client().score("JD", "CV").kind == "invalid", bad
+
+
 def test_score_accepts_empty_lists():
     with patch("llm.requests.post", return_value=_resp(200, {**GOOD, "missing_confirmed": [], "missing_unknown": []})):
         assert _client().score("JD", "CV").ok

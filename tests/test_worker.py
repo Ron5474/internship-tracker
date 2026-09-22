@@ -21,6 +21,7 @@ T0 = datetime(2026, 9, 19, 12, 0, 0)
 
 RON = User(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"], sections=["software"])
 COUSIN = User(id="cousin", cv="/x", discord_webhook="https://d/cousin", feeds=["internships"], sections=["software"])
+DANA = User(id="dana", cv="/x", discord_webhook="https://d/dana", feeds=["internships"], sections=["software"])
 
 
 class FakeSender:
@@ -556,10 +557,10 @@ def test_fail_fetch_moves_score_rows_to_deliver(session_factory, session, clock)
 
 from cv import load_cv
 from llm import LLMResult, ScoreResponse
-from worker import LLM_PAUSE_SECONDS, SCORE_BUDGET
+from worker import INVALID_STREAK_LIMIT, LLM_PAUSE_SECONDS, SCORE_BUDGET
 
 CV_DICT = load_cv("tests/fixtures/cv_sample.yaml").model_dump()
-CVS = {"ron": CV_DICT, "cousin": CV_DICT}
+CVS = {"ron": CV_DICT, "cousin": CV_DICT, "dana": CV_DICT}
 
 def _llm_ok(score=82):
     return LLMResult("ok", ScoreResponse(score=score, reasoning="Because.", missing_confirmed=["K8s"], missing_unknown=["visa"]),
@@ -568,6 +569,8 @@ def _llm_ok(score=82):
 LLM_TRANSIENT = LLMResult("transient", None, "HTTP 503", None, None, None, 5)
 LLM_INVALID = LLMResult("invalid", None, "schema", None, None, None, 5)
 LLM_DOWN = LLMResult("unavailable", None, "ConnectionError: refused", None, None, None, 5)
+LLM_UNUSABLE = LLMResult("ok", ScoreResponse(score=0, reasoning="Login wall.", missing_confirmed=[], missing_unknown=[],
+                                             posting_usable=False), None, None, "deepseek-v4-flash", None, 5)
 
 
 class FakeLLM:
@@ -719,6 +722,60 @@ def test_score_invalid_does_not_cool_down_llm(session_factory, session, clock):
     w = _worker_s(session_factory, FakeLLM(LLM_INVALID), clock)
     w.run_once()
     assert "llm" not in w.paused
+
+
+def test_score_unusable_posting_falls_back_to_link_only(session_factory, session, clock):
+    ev = _seed_scoreable(session)
+    sender = FakeSender(OK)
+    w = _worker_s(session_factory, FakeLLM(LLM_UNUSABLE), clock, sender)
+    assert w.run_once() is True         # score: model says this is not a posting
+    session.refresh(ev)
+    assert ev.outcome == "score_failed" and ev.stage == STAGE_DELIVER and ev.score is None
+    assert w.run_once() is True         # deliver link-only
+    assert "(couldn't score)" in sender.calls[0][1]
+    assert "llm" not in w.paused
+
+
+def test_invalid_streak_pauses_llm(session_factory, session, clock):
+    for uid in ("ron", "cousin", "dana"):
+        _seed_scoreable(session, uid)
+    w = _worker_s(session_factory, FakeLLM(*[LLM_INVALID] * INVALID_STREAK_LIMIT), clock, users=(RON, COUSIN, DANA))
+    assert INVALID_STREAK_LIMIT == 3
+    w.run_once(); w.run_once()
+    assert "llm" not in w.paused
+    w.run_once()
+    assert w.paused["llm"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+
+
+def test_invalid_streak_resets_on_ok(session_factory, session, clock):
+    for uid in ("ron", "cousin", "dana"):
+        _seed_scoreable(session, uid)
+    llm = FakeLLM(LLM_INVALID, LLM_INVALID, _llm_ok(30), LLM_INVALID)   # 30: dana's row closes, nothing to deliver
+    w = _worker_s(session_factory, llm, clock, users=(RON, COUSIN, DANA))
+    w.run_once(); w.run_once(); w.run_once()      # invalid, invalid, ok
+    clock.advance(BACKOFF_SECONDS[0])             # ron's row is due again
+    assert w.run_once() is True                   # invalid: streak is 1, not 3
+    assert len(llm.calls) == 4
+    assert "llm" not in w.paused
+
+
+def test_score_retry_after_zero_is_floored(session_factory, session, clock):
+    ev = _seed_scoreable(session)
+    w = _worker_s(session_factory, FakeLLM(LLMResult("transient", None, "429", 0.0, None, None, 1)), clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.next_attempt_at == T0 + timedelta(seconds=1)
+
+
+def test_score_invalid_snapshot_gives_up_without_call(session_factory, session, clock):
+    ev = _seed_scoreable(session, cv_snapshot={"name": "x"})
+    llm = FakeLLM(_llm_ok())
+    w = _worker_s(session_factory, llm, clock)
+    assert w.run_once() is True
+    session.refresh(ev)
+    assert llm.calls == []
+    assert ev.outcome == "score_failed" and ev.stage == STAGE_DELIVER and ev.attempts == 0
+    assert "cv_snapshot invalid" in ev.last_error
 
 
 def test_score_deadlines_are_measured_from_after_the_call(session_factory, session, clock):

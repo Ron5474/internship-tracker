@@ -3,6 +3,7 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
 from cv import MasterCV, cv_to_text
@@ -21,6 +22,7 @@ FETCH_MAX_AGE_HOURS = 24
 FETCH_GAP_SECONDS = 2
 SCORE_BUDGET = 3
 LLM_PAUSE_SECONDS = 900
+INVALID_STREAK_LIMIT = 3
 
 _LINK_ONLY_NOTES = {
     "fetch_failed": "couldn't read the description",
@@ -60,6 +62,7 @@ class Worker:
         self._fetch = fetch
         self._now = now
         self._fetch_not_before: datetime | None = None
+        self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -238,13 +241,18 @@ class Worker:
             return
         if ev.cv_snapshot is None:
             ev.cv_snapshot = self._cvs[ev.user_id]
+        try:
+            cv_text = cv_to_text(MasterCV.model_validate(ev.cv_snapshot))
+        except ValidationError as e:
+            # A hand-edited or pre-schema snapshot: no call would be meaningful, and no lease is owed.
+            self._give_up_scoring(ev, now, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:300]}")
+            return
         # Lease the attempt before the (slow, crash-prone) call, like fetch.
         ev.attempts += 1
         ev.next_attempt_at = now + timedelta(seconds=backoff(ev.attempts))
         session.commit()
 
         description = (ev.job.description or "")[:DESCRIPTION_CAP]
-        cv_text = cv_to_text(MasterCV.model_validate(ev.cv_snapshot))
         try:
             result = self._llm.score(description, cv_text)
         except Exception as e:  # noqa: BLE001 — a client bug is a failed attempt, not a dead worker
@@ -253,11 +261,26 @@ class Worker:
         after = self._now()   # deadlines below are measured from when the call came back
 
         usage = result.usage or {}
+        outcome = self._score_outcome(result, user)
         log.info("score ev=%d user=%s model=%s outcome=%s score=%s ms=%d tokens=%s/%s%s",
-                 ev.id, ev.user_id, result.model or self._llm_model_name(), self._score_outcome(result, user),
-                 result.data.score if result.ok else "-", result.ms,
+                 ev.id, ev.user_id, result.model or self._llm_model_name(), outcome,
+                 result.data.score if outcome in ("matched", "below_threshold") else "-", result.ms,
                  usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
                  f" error={result.error}" if result.error else "")
+
+        if result.kind == "invalid":
+            self._invalid_streak += 1
+            if self._invalid_streak >= INVALID_STREAK_LIMIT:
+                self._invalid_streak = 0
+                self._pause("llm", after + timedelta(seconds=LLM_PAUSE_SECONDS),
+                            f"{INVALID_STREAK_LIMIT} consecutive invalid replies — model/schema mismatch?")
+        else:
+            self._invalid_streak = 0
+
+        if result.ok and result.data.posting_usable is False:
+            # The model read an error page / login wall, not a posting: nothing to score, deliver the link.
+            self._give_up_scoring(ev, after, "posting not usable per model")
+            return
 
         if result.ok:
             data = result.data
@@ -283,6 +306,7 @@ class Worker:
 
         ev.last_error = result.error
         delay = result.retry_after if result.retry_after is not None else backoff(ev.attempts)
+        delay = max(delay, 1)   # Retry-After: 0 must not schedule an immediate retry
         if result.kind == "transient":
             # A 429/5xx/timeout says the shared endpoint is unwell: hold every other row for the
             # backoff — even when this row is about to give up and be delivered link-only.
@@ -305,6 +329,8 @@ class Worker:
     def _score_outcome(result: LLMResult, user: User) -> str:
         if not result.ok:
             return result.kind
+        if result.data.posting_usable is False:
+            return "unusable"
         return "matched" if result.data.score >= user.threshold else "below_threshold"
 
     # -- deliver stage ------------------------------------------------------
