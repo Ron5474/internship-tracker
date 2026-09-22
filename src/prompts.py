@@ -17,13 +17,20 @@ Rubric (use the whole range; be consistent across postings):
 years of professional experience and the CV shows internships only), not merely that the CV
 is silent on it.
 
+Location: if the posting is on-site/hybrid in a place the candidate's stated location does not
+match, list it under `missing_unknown` (relocation is the candidate's call), never under
+`missing_confirmed`; remote postings have no location requirement.
+
+If the posting lists no hard requirements at all, score on the preferred/desired ones and say
+so in the reasoning.
+
 If the text is not a job posting (an error page, login wall, cookie banner, navigation only,
 or a list of unrelated jobs), set `posting_usable` to false, `score` to 0 and leave the lists empty.
 
 Reply with ONLY a JSON object, no prose, no code fences:
 {
   "score": <integer 0-100>,
-  "reasoning": "<two or three sentences on the strongest evidence for and against>",
+  "reasoning": "<two or three sentences, under 400 characters, on the strongest evidence for and against>",
   "missing_confirmed": ["<requirement the CV clearly does not meet>", ...],
   "missing_unknown": ["<requirement the CV does not mention either way>", ...],
   "posting_usable": <true|false>
@@ -31,8 +38,9 @@ Reply with ONLY a JSON object, no prose, no code fences:
 Keep each list item under 12 words. Empty lists are fine.
 """
 
+
 def score_user_message(description: str, cv_text: str) -> str:
-    return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}"
+    return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}\n\nReturn the JSON object now."
 
 
 def reask_message(problem: str) -> str:

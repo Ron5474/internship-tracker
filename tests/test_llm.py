@@ -35,11 +35,17 @@ def test_system_prompt_carries_rubric_and_schema():
     assert "90–100" in flat and "below 50" in flat
     assert '"missing_unknown"' in flat
     assert "does not lower the score" in flat
+    # Location mismatches are the candidate's call: unknown, never confirmed-missing.
+    assert "relocation" in flat and flat.index("Location:") < flat.index("relocation")
+    assert "no hard requirements" in flat
+    assert "400 characters" in flat
+    assert '"posting_usable": <true|false>' in flat
 
 
 def test_user_message_contains_both_inputs_in_order():
     m = score_user_message("JOB TEXT", "CV TEXT")
     assert m.index("JOB TEXT") < m.index("CV TEXT")
+    assert m.endswith("Return the JSON object now.")
 
 
 # --- classify ----------------------------------------------------------------
