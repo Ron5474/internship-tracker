@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="utf-8"><title>{{ name }}</title></head>
+<body>
+  <header>
+    <h1>{{ name }}</h1>
+    <p class="contact">{{ contact_line }}</p>
+  </header>
+
+  {% if summary %}<section><p class="summary">{{ summary }}</p></section>{% endif %}
+
+  {% if education %}
+  <section>
+    <h2>Education</h2>
+    {% for e in education %}
+    <div class="entry">
+      <div class="row"><span class="left">{{ e.school }}</span><span class="right">{{ e.dates }}</span></div>
+      <div class="row"><span class="sub">{{ e.degree }}</span></div>
+      {% if e.details %}<ul>{% for d in e.details %}<li>{{ d }}</li>{% endfor %}</ul>{% endif %}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if experience %}
+  <section>
+    <h2>Experience</h2>
+    {% for x in experience %}
+    <div class="entry">
+      <div class="row"><span class="left">{{ x.company }}</span><span class="right">{{ x.dates }}</span></div>
+      <div class="row"><span class="sub">{{ x.title }}</span>{% if x.location %}<span class="right">{{ x.location }}</span>{% endif %}</div>
+      <ul>{% for b in x.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if projects %}
+  <section>
+    <h2>Projects</h2>
+    {% for p in projects %}
+    <div class="entry">
+      <div class="row">
+        <span class="left">{{ p.name }}</span>
+        {% if p.tech %}<span class="tech">{{ p.tech | join(', ') }}</span>{% endif %}
+        {% if p.dates %}<span class="right">{{ p.dates }}</span>{% endif %}
+      </div>
+      {% if p.link or p.demo %}
+      <div class="row"><span class="links">
+        {% if p.link %}<a href="{{ p.link }}">{{ p.link }}</a>{% endif %}
+        {% if p.demo %}{% if p.link %} · {% endif %}<a href="{{ p.demo }}">{{ p.demo }}</a>{% endif %}
+      </span></div>
+      {% endif %}
+      <ul>{% for b in p.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  {% if skills %}
+  <section>
+    <h2>Skills</h2>
+    {% for group, items in skills.items() %}
+    <p class="skills"><span class="left">{{ group | title }}:</span> {{ items | join(', ') }}</p>
+    {% endfor %}
+  </section>
+  {% endif %}
+</body>
+</html>

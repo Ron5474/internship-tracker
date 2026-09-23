@@ -3,29 +3,71 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from llm import LLMClient, LLMResult, ScoreResponse, classify_status
-from prompts import SCORE_SYSTEM, score_user_message
+from llm import LLMClient, LLMResult, ScoreResponse, TailorResponse, classify_status
+from prompts import SCORE_SYSTEM, TAILOR_SYSTEM, score_user_message
 
 GOOD = {"score": 82, "reasoning": "Strong Python and FastAPI match.", "missing_confirmed": ["Kubernetes"],
         "missing_unknown": ["work authorization"]}
 
+TAILOR_JSON = json.dumps({
+    "experience": [{"id": "exp1", "bullets": ["exp1.b2", "exp1.b1"]}],
+    "projects": [{"id": "proj3", "bullets": ["proj3.b1"]}],
+    "skills": {"languages": ["Python"]},
+})
 
-def _resp(status, content=None, headers=None, usage=None, raw=None):
+
+def _resp(status, content=None, headers=None, usage=None, raw=None, model="deepseek-v4-flash"):
     r = Mock()
     r.status_code = status
     r.headers = headers or {}
     body = raw if raw is not None else {
         "choices": [{"message": {"content": content if isinstance(content, str) else json.dumps(content)}}],
         "usage": usage or {"prompt_tokens": 1200, "completion_tokens": 80},
-        "model": "deepseek-v4-flash",
+        "model": model,
     }
     r.json.return_value = body
     r.text = json.dumps(body) if isinstance(body, dict) else str(body)
     return r
 
 
-def _client():
-    return LLMClient("http://llm:4000/v1", "sk-test", "deepseek-v4-flash", timeout=7)
+def _client(model="deepseek-v4-flash"):
+    return LLMClient("http://llm:4000/v1", "sk-test", model, timeout=7)
+
+
+def _mock_ok(monkeypatch, content, model="deepseek-v4-flash", usage=None):
+    """Every call to requests.post succeeds with the same content."""
+    monkeypatch.setattr("llm.requests.post", Mock(return_value=_resp(200, content, usage=usage, model=model)))
+
+
+def _mock_capture(monkeypatch, seen, content, model="deepseek-v4-flash"):
+    """Records the outgoing url/headers/json/timeout of the (first) call into `seen`."""
+    def fake_post(url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers")
+        seen["payload"] = kwargs.get("json")
+        seen["timeout"] = kwargs.get("timeout")
+        return _resp(200, content, model=model)
+    monkeypatch.setattr("llm.requests.post", Mock(side_effect=fake_post))
+
+
+def _mock_sequence(monkeypatch, *contents):
+    """Each call to requests.post returns the next content in order (all HTTP 200).
+    Returns the mock's call_args_list, which grows as calls happen."""
+    mock = Mock(side_effect=[_resp(200, c) for c in contents])
+    monkeypatch.setattr("llm.requests.post", mock)
+    return mock.call_args_list
+
+
+def _mock_status(monkeypatch, status, headers=None):
+    """Every call to requests.post fails with the given HTTP status."""
+    monkeypatch.setattr("llm.requests.post",
+                         Mock(return_value=_resp(status, raw={"error": {"message": "boom"}}, headers=headers)))
+
+
+def _mock_then_status(monkeypatch, content, status):
+    """First call succeeds with `content` (ok but possibly unparseable), second call fails with `status`."""
+    monkeypatch.setattr("llm.requests.post",
+                         Mock(side_effect=[_resp(200, content), _resp(status, raw={"error": {"message": "boom"}})]))
 
 
 # --- prompts -----------------------------------------------------------------
@@ -208,3 +250,68 @@ def test_score_400_is_invalid():
 def test_llm_result_ok_property():
     assert LLMResult("ok", ScoreResponse(**GOOD), None, None, "m", None, 1).ok
     assert not LLMResult("transient", None, "x", None, None, None, 1).ok
+
+
+# --- tailor --------------------------------------------------------------
+
+def test_tailor_parses_a_valid_selection(monkeypatch):
+    client = _client(model="pro")
+    _mock_ok(monkeypatch, TAILOR_JSON, model="pro")
+    result = client.tailor("JD text", "[exp1] ...", 4)
+    assert result.ok
+    assert isinstance(result.data, TailorResponse)
+    assert result.data.experience[0].bullets == ["exp1.b2", "exp1.b1"]
+    assert result.model == "pro"
+
+
+def test_tailor_sends_the_tailor_system_prompt_and_the_bullet_cap(monkeypatch):
+    seen = {}
+    _mock_capture(monkeypatch, seen, TAILOR_JSON)
+    _client(model="pro").tailor("JD text", "[exp1] a bullet", 3)
+    messages = seen["payload"]["messages"]
+    assert messages[0]["content"] == TAILOR_SYSTEM
+    assert "[exp1] a bullet" in messages[1]["content"]
+    assert "3" in messages[1]["content"]
+    assert seen["payload"]["response_format"] == {"type": "json_object"}
+
+
+def test_tailor_free_text_instead_of_ids_is_invalid_after_one_reask(monkeypatch):
+    bad = json.dumps({"experience": [{"id": "exp1", "bullets": [{"text": "I rewrote this"}]}],
+                      "projects": [], "skills": {}})
+    calls = _mock_sequence(monkeypatch, bad, bad)
+    result = _client(model="pro").tailor("JD", "cv", 4)
+    assert result.kind == "invalid"
+    assert len(calls) == 2
+    assert "schema validation failed after re-ask" in result.error
+
+
+def test_tailor_recovers_when_the_reask_returns_valid_json(monkeypatch):
+    _mock_sequence(monkeypatch, "not json at all", TAILOR_JSON)
+    result = _client(model="pro").tailor("JD", "cv", 4)
+    assert result.ok and result.data.projects[0].id == "proj3"
+
+
+def test_tailor_missing_sections_default_to_empty(monkeypatch):
+    _mock_ok(monkeypatch, json.dumps({"experience": [{"id": "exp1", "bullets": []}]}), model="pro")
+    result = _client(model="pro").tailor("JD", "cv", 4)
+    assert result.ok and result.data.projects == [] and result.data.skills == {}
+
+
+def test_tailor_401_is_unavailable(monkeypatch):
+    _mock_status(monkeypatch, 401)
+    result = _client(model="pro").tailor("JD", "cv", 4)
+    assert result.kind == "unavailable"
+
+
+# --- re-ask edge cases deferred from Plan 3's review ----------------------
+
+def test_reask_second_call_failing_is_reported_as_that_failure(monkeypatch):
+    _mock_then_status(monkeypatch, "not json", 500)
+    result = _client().score("JD", "cv")
+    assert result.kind == "transient" and "500" in result.error
+
+
+def test_429_without_retry_after_has_no_retry_after(monkeypatch):
+    _mock_status(monkeypatch, 429, headers={})
+    result = _client().score("JD", "cv")
+    assert result.kind == "transient" and result.retry_after is None

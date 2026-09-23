@@ -36,8 +36,24 @@ jobs:
           load: true
           tags: internship-tracker:ci
 
-      - name: Smoke-test the image imports cleanly
-        run: docker run --rm internship-tracker:ci python -c "import main"
+      - name: Smoke-test the image renders a PDF
+        run: |
+          docker run --rm internship-tracker:ci python -c "
+          import main, render
+          from cv import MasterCV
+          cv = MasterCV.model_validate({
+              'name': 'Smoke Test',
+              'contact': {'email': 's@example.com'},
+              'education': [{'id': 'edu1', 'school': 'U', 'degree': 'BS', 'dates': '2024'}],
+              'experience': [{'id': 'exp1', 'company': 'C', 'title': 'T', 'dates': 'D',
+                              'bullets': [{'id': 'exp1.b1', 'text': 'Did a thing'}]}],
+          })
+          r = render.render_pdf(cv, {'experience': [{'id': 'exp1', 'bullets': ['exp1.b1']}],
+                                     'projects': [], 'skills': {}}, '/tmp/smoke.pdf')
+          assert open('/tmp/smoke.pdf','rb').read(4) == b'%PDF', 'not a PDF'
+          assert r.pages == 1, r.pages
+          print('render smoke ok')
+          "
 
       - uses: docker/login-action@v3
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'

@@ -27,7 +27,7 @@ def load_cvs(users: list[User]) -> dict[str, dict]:
     return {u.id: load_cv(u.cv).model_dump() for u in users}
 
 
-def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] | None = None):
+def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] | None = None, tailor=None):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
     added = ensure_columns(engine)
@@ -45,8 +45,14 @@ def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] 
         cvs = load_cvs(users)
     if llm is None:
         llm = LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_score_model, settings.llm_timeout)
-    log.info("Scoring with %s at %s", settings.llm_score_model, settings.llm_base_url)
-    return session_factory, Worker(session_factory, users, cvs=cvs, llm=llm)
+    if tailor is None:
+        tailor = LLMClient(settings.llm_base_url, settings.llm_api_key,
+                           settings.llm_tailor_model, settings.llm_timeout)
+    output_dir = os.path.join(settings.data_dir, "output")
+    log.info("Scoring with %s, tailoring with %s at %s",
+             settings.llm_score_model, settings.llm_tailor_model, settings.llm_base_url)
+    return session_factory, Worker(session_factory, users, cvs=cvs, llm=llm, tailor=tailor,
+                                   output_dir=output_dir, max_bullets=settings.max_bullets_per_entry)
 
 
 def poll_all(session_factory, users: list[User], settings: Settings) -> None:

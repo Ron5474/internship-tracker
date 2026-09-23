@@ -1,0 +1,80 @@
+name: Sample Applicant
+contact:
+  email: applicant@example.com
+  phone: "+1 555 0101"
+  location: Austin, TX
+  linkedin: https://www.linkedin.com/in/sampleapplicant/
+  github: https://github.com/sampleapplicant
+summary: Backend-leaning software engineer with internship experience across web APIs, data pipelines, and infra automation.
+education:
+  - id: edu1
+    school: Sample State University
+    degree: BS Computer Science
+    dates: 2022 – 2026
+    details: ["GPA 3.8", "Dean's List x3"]
+experience:
+  - id: exp1
+    company: Initech
+    title: Backend Engineering Intern
+    dates: Summer 2025
+    location: Remote
+    bullets:
+      - {id: exp1.b1, text: "Built a FastAPI service handling 2k requests per second in production."}
+      - {id: exp1.b2, text: "Wrote SQLAlchemy migrations for a multi-tenant schema change."}
+      - {id: exp1.b3, text: "Added integration tests that cut regression bugs by 30%."}
+  - id: exp2
+    company: Globex Corp
+    title: Software Engineering Intern
+    dates: Summer 2024
+    location: Austin, TX
+    bullets:
+      - {id: exp2.b1, text: "Implemented a Discord webhook notifier for CI build failures."}
+      - {id: exp2.b2, text: "Optimized a nightly ETL job, reducing runtime from 40 to 12 minutes."}
+      - {id: exp2.b3, text: "Paired with senior engineers to design a rate-limiting middleware."}
+  - id: exp3
+    company: Hooli
+    title: Data Engineering Intern
+    dates: Summer 2023
+    location: Remote
+    bullets:
+      - {id: exp3.b1, text: "Wrote Python ETL scripts ingesting 5M rows/day from third-party APIs."}
+      - {id: exp3.b2, text: "Containerized data pipelines with Docker for reproducible deployments."}
+      - {id: exp3.b3, text: "Documented internal tooling used by three engineering teams."}
+projects:
+  - id: proj1
+    name: Internship Tracker
+    dates: 2026
+    tech: [Python, FastAPI, SQLite]
+    link: https://github.com/sampleapplicant/internship-tracker
+    demo: https://tracker.example.com
+    bullets:
+      - {id: proj1.b1, text: "Polls job boards and scores postings with an LLM."}
+      - {id: proj1.b2, text: "Posts new matches to Discord via webhook."}
+      - {id: proj1.b3, text: "Tracks application stages in a SQLite database."}
+      - {id: proj1.b4, text: "Deploys via GitHub Actions to a self-hosted Docker host."}
+  - id: proj2
+    name: Recipe Sharer
+    dates: 2025
+    tech: [React, FastAPI]
+    link: https://github.com/sampleapplicant/recipe-sharer
+    bullets:
+      - {id: proj2.b1, text: "Built a React frontend for browsing and rating recipes."}
+      - {id: proj2.b2, text: "Added OIDC login via Authentik."}
+  - id: proj3
+    name: Budget CLI
+    dates: 2024
+    tech: [Python, SQLite]
+    bullets:
+      - {id: proj3.b1, text: "Command-line tool for tracking monthly expenses."}
+      - {id: proj3.b2, text: "Generates spending reports as CSV exports."}
+  - id: proj4
+    name: Weather Bot
+    dates: 2023
+    tech: [Python]
+    bullets:
+      - {id: proj4.b1, text: "Fetches forecasts from a public weather API."}
+      - {id: proj4.b2, text: "Sends daily summaries to a Discord channel."}
+skills:
+  languages: [Python, Go, TypeScript]
+  frameworks: [FastAPI, React, SQLAlchemy]
+  tools: [Docker, SQLite, GitHub Actions]

@@ -1,4 +1,5 @@
 import tempfile
+import uuid
 from datetime import datetime
 
 import pytest
@@ -10,10 +11,14 @@ from config import FEEDS
 from db import (
     FETCH_OK,
     FETCH_PENDING,
+    STAGE_DELIVER,
+    STAGE_RENDER,
     STAGE_SCORE,
+    STAGE_TAILOR,
     Evaluation,
     Feed,
     Job,
+    drain_resume_stages,
     ensure_columns,
     ensure_feeds,
     import_legacy_state,
@@ -211,3 +216,33 @@ def test_evaluation_defaults_to_score_stage_with_score_columns(session):
     assert ev.stage == STAGE_SCORE
     assert ev.score_model is None
     assert ev.score_usage is None
+
+
+def test_ensure_columns_adds_resume_error(tmp_path):
+    # A database written before Plan 4 gains the column without a migration.
+    path = str(tmp_path / "old.db")
+    engine = make_engine(path)
+    init_db(engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE evaluations DROP COLUMN resume_error"))
+    assert "evaluations.resume_error" in ensure_columns(engine)
+    assert "resume_error" in {c["name"] for c in inspect(engine).get_columns("evaluations")}
+
+
+def _eval_at(session, stage, **kw):
+    feed = session.query(Feed).filter_by(name="internships").first() or Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed, key=f"https://x.com/{uuid.uuid4()}")
+    ev = Evaluation(job=job, user_id="ron", stage=stage, **kw)
+    session.add_all([feed, job, ev])
+    session.commit()
+    return ev
+
+
+def test_drain_resume_stages_moves_queued_rows_to_deliver(session_factory, session):
+    a = _eval_at(session, STAGE_TAILOR)          # small helper: an Evaluation at the given stage
+    b = _eval_at(session, STAGE_RENDER)
+    c = _eval_at(session, STAGE_SCORE)
+    assert drain_resume_stages(session) == 2
+    session.commit()
+    assert a.stage == b.stage == STAGE_DELIVER and c.stage == STAGE_SCORE
+    assert "not configured" in a.resume_error and a.pdf_path is None

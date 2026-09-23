@@ -24,6 +24,8 @@ from config import FeedSpec
 from state import read_known_urls, read_last_sha
 
 STAGE_SCORE = "score"
+STAGE_TAILOR = "tailor"
+STAGE_RENDER = "render"
 STAGE_DELIVER = "deliver"
 STAGE_CLOSED = "closed"
 
@@ -90,7 +92,7 @@ class Evaluation(Base):
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"))
     user_id: Mapped[str] = mapped_column(String)
 
-    # Next action to run: score → deliver → closed (tailor/render arrive in Plan 4).
+    # Next action to run: score → tailor → render → deliver → closed.
     stage: Mapped[str] = mapped_column(String, default=STAGE_SCORE)
     # Written once at a fallback decision; never overwritten.
     outcome: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -103,7 +105,10 @@ class Evaluation(Base):
     score_model: Mapped[str | None] = mapped_column(String, nullable=True)
     score_usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tailored: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    tailor_model: Mapped[str | None] = mapped_column(String, nullable=True)
     pdf_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Why a match went out without a PDF. Diagnostic; `outcome` stays "matched".
+    resume_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_overflow: Mapped[bool] = mapped_column(Boolean, default=False)
 
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -174,6 +179,22 @@ def import_legacy_state(session: Session, data_dir: str) -> int:
     feed.last_sha = read_last_sha(data_dir)
     session.flush()
     return len(known)
+
+
+def drain_resume_stages(session: Session) -> int:
+    """Move rows queued for tailoring or rendering to delivery.
+
+    Called from Worker.startup() when this process has no tailor client or no output directory.
+    Those rows were queued by a process that did, and nothing here will ever pick them up; without
+    this they sit at their stage forever while the user waits for a notification already paid for.
+    """
+    rows = session.query(Evaluation).filter(Evaluation.stage.in_((STAGE_TAILOR, STAGE_RENDER))).all()
+    for ev in rows:
+        ev.resume_error = ev.resume_error or "tailoring not configured in this process"
+        ev.stage, ev.attempts = STAGE_DELIVER, 0
+        ev.pdf_path, ev.page_overflow = None, False
+        ev.next_attempt_at = utcnow()
+    return len(rows)
 
 
 def ensure_columns(engine: Engine, metadata: MetaData = Base.metadata) -> list[str]:
