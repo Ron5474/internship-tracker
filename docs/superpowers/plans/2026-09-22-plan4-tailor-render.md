@@ -215,11 +215,14 @@ from cv import MAX_EXPERIENCE_ENTRIES, MAX_PROJECT_ENTRIES, cv_to_id_text, load_
 
 # A CV with room to choose from: the 1-experience/1-project `cv_sample.yaml` cannot distinguish
 # "the validator filtered correctly" from "the too-few-entries fallback replaced the selection".
-FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")
+# A NEW NAME: `FIXTURE` already exists at tests/test_cv.py:8 and nine tests read it, including
+# test_all_ids_covers_entries_and_bullets, which asserts cv_sample.yaml's exact id set. Rebinding
+# it would break them. Leave line 8 alone.
+TAILOR_FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")
 
 
 def _cv():
-    return load_cv(FIXTURE)
+    return load_cv(TAILOR_FIXTURE)
 
 
 def test_id_text_labels_every_entry_and_bullet():
@@ -234,13 +237,16 @@ def test_id_text_labels_every_entry_and_bullet():
 
 
 def test_unknown_entry_is_dropped_with_a_warning():
+    # Two valid entries, so what survives is the filtering and not the fallback.
     cv = _cv()
-    good = cv.experience[0]
+    a, b = cv.experience[0], cv.experience[1]
     sel, warnings = validate_selection(cv, {
-        "experience": [{"id": "nope", "bullets": []}, {"id": good.id, "bullets": [good.bullets[0].id]}],
+        "experience": [{"id": "nope", "bullets": []},
+                       {"id": a.id, "bullets": [a.bullets[0].id]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
         "projects": [], "skills": {},
     })
-    assert [e["id"] for e in sel["experience"]] == [good.id]
+    assert [e["id"] for e in sel["experience"]] == [a.id, b.id]
     assert any("nope" in w for w in warnings)
 
 
@@ -355,7 +361,7 @@ def test_extra_key_in_cv_yaml_is_rejected():
     # Guards `extra="forbid"` on the CV schema — carried over from Plan 3's review.
     import pytest
     import yaml
-    raw = yaml.safe_load(Path(FIXTURE).read_text())
+    raw = yaml.safe_load(Path(TAILOR_FIXTURE).read_text())
     raw["favourite_colour"] = "blue"
     from cv import MasterCV
     with pytest.raises(Exception):
@@ -756,7 +762,10 @@ import pytest
 from cv import load_cv
 from render import output_path, render_pdf
 
-FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")
+# cv_tailor.yaml (Task 2), not cv_sample.yaml: these tests slice two experience entries and two
+# projects, need a project carrying a `link` and a `demo`, and need enough content that the
+# overflow case genuinely runs past one page. cv_sample.yaml has one entry per section.
+FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")
 
 
 @pytest.fixture
@@ -1163,13 +1172,22 @@ def test_notes_survive_an_oversized_reasoning():
     assert OVERFLOW_NOTE in msg and NO_RESUME_NOTE in msg
 
 
-def test_lists_are_dropped_before_the_reasoning_is():
-    # Spec order: gaps and unknowns are truncated first, the reasoning second.
-    msg = format_match("Stripe", "SWE", "SF", "https://x", 82, "r" * 1900, ["a confirmed gap"], [],
-                       matched=True)
+def test_lists_are_truncated_before_the_reasoning_is():
+    # Spec order: gaps and unknowns give way first, the reasoning second. The inputs must actually
+    # overflow — a 1,900-character reasoning plus one short gap line still fits in 2,000 and would
+    # prove nothing. Assert the relationship, not a character count.
+    gaps = ["a confirmed gap that is quite wordy"] * 20      # ~750 characters once joined
+    msg = format_match("Stripe", "SWE", "SF", "https://x", 82, "r" * 1500, gaps, [], matched=True)
     assert len(msg) <= 2000
-    assert "r" * 1000 in msg
-    assert "a confirmed gap" not in msg
+    assert "✅ Why: " + "r" * 1500 in msg                     # the reasoning survives intact
+    assert msg.count("a confirmed gap") < len(gaps)          # the gaps line did not
+    assert msg.rstrip().endswith("…")
+
+
+def test_cap_content_never_exceeds_the_limit_for_any_input():
+    from discord_client import cap_content
+    assert len(cap_content("head", [], tail="x" * 5000)) <= 2000
+    assert len(cap_content("h" * 5000, ["y" * 5000], tail="t" * 5000, body="b" * 5000)) <= 2000
 
 
 def test_a_short_message_is_untouched():
@@ -1183,15 +1201,19 @@ def test_send_message_with_a_missing_pdf_reports_an_attachment_failure(tmp_path)
     assert result.kind == "attachment" and "gone.pdf" in result.error
 
 
-def test_send_message_with_an_unreadable_pdf_reports_an_attachment_failure(tmp_path):
+def test_send_message_with_an_unreadable_pdf_reports_an_attachment_failure(monkeypatch, tmp_path):
+    # Not chmod(0o000): CI runs as root, which reads it anyway, and the test would fall through
+    # to a real HTTP request. Shadow the module's `open` instead — Python resolves module globals
+    # before builtins, so this affects discord_client only.
     pdf = tmp_path / "locked.pdf"
     pdf.write_bytes(b"%PDF stub")
-    pdf.chmod(0o000)
-    try:
-        result = send_message("https://d/x", "hi", str(pdf))
-    finally:
-        pdf.chmod(0o644)
-    assert result.kind == "attachment"      # exists() is true; opening it is what fails
+
+    def denied(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr("discord_client.open", denied, raising=False)
+    result = send_message("https://d/x", "hi", str(pdf))
+    assert result.kind == "attachment"      # the file exists; opening it is what fails
 
 
 def test_attachment_failure_makes_no_request(monkeypatch, tmp_path):
@@ -1250,6 +1272,12 @@ def cap_content(header: str, lists: list[str], tail: str = "", body: str = "") -
     resume notices, and the difference between "apply with this PDF" and "apply with your master
     CV" must not be what gets dropped. List lines go first, then the body (the reasoning).
     """
+    if len(tail) > MAX_CONTENT:
+        # The notices are short fixed strings, so this never fires today. It is here because the
+        # cap is absolute: this helper must not return more than MAX_CONTENT characters for ANY
+        # input, and the branch below would otherwise hand an oversized tail straight back.
+        tail = tail[: MAX_CONTENT - 1] + _ELLIPSIS
+
     tail_cost = len(tail) + 1 if tail else 0
     if len(header) + tail_cost > MAX_CONTENT:
         # Pathological: even the header does not fit. It gives way, never the tail.
@@ -2179,9 +2207,9 @@ Add the startup drain to `src/db.py`, beside `import_legacy_state`:
 def drain_resume_stages(session: Session) -> int:
     """Move rows queued for tailoring or rendering to delivery.
 
-    Called only when this process has no tailor client or no output directory. Those rows were
-    queued by a build that did, and nothing in this process will ever pick them up; without this
-    they sit at their stage forever while the user waits for a notification that was already paid for.
+    Called from Worker.startup() when this process has no tailor client or no output directory.
+    Those rows were queued by a process that did, and nothing here will ever pick them up; without
+    this they sit at their stage forever while the user waits for a notification already paid for.
     """
     rows = session.query(Evaluation).filter(Evaluation.stage.in_((STAGE_TAILOR, STAGE_RENDER))).all()
     for ev in rows:
@@ -2217,19 +2245,62 @@ Then in `src/main.py`'s `build`, after the score client:
                                    output_dir=output_dir, max_bullets=settings.max_bullets_per_entry)
 ```
 
-and, in the `with session_factory() as session:` block that already runs `ensure_feeds` and
-`import_legacy_state`, drain when this process cannot tailor:
+**The drain does not belong in `build`.** `build` constructs the tailor client and the output
+directory itself, so a `tailor is None` check there can never be true, and a `Worker` constructed
+directly — which is how every worker test and any future caller does it — never passes through
+`build` at all. Hang it off the worker's own startup instead, in `src/worker.py`:
 
 ```python
-        if tailor is None or output_dir is None:
+    def startup(self) -> None:
+        """One-time work before the loop.
+
+        Rows queued for tailoring or rendering by a process that had a tailor client would sit
+        forever in one that does not. Move them to delivery so the score still reaches the user.
+        """
+        if self._tailoring_enabled:
+            return
+        with self._sessions() as session:
             drained = drain_resume_stages(session)
-            if drained:
-                log.warning("Tailoring not configured: %d queued row(s) will be delivered "
-                            "with the score only", drained)
+            session.commit()
+        if drained:
+            log.warning("Tailoring not configured: %d queued row(s) will be delivered "
+                        "with the score only", drained)
+
+    def run_forever(self, idle_sleep: float = 3.0) -> None:
+        self.startup()
+        while True:
+            ...        # the existing loop body, unchanged
 ```
 
-Note this requires `tailor` and `output_dir` to be computed before that block — move the two lines
-above it rather than adding a second session.
+`main()` already calls `worker.run_forever()`, so nothing else changes there. Tests call
+`startup()` explicitly; `run_once()` never triggers it, which is what keeps the Plan 1–3 worker
+tests untouched.
+
+Its test, in `tests/test_worker.py`:
+
+```python
+def test_startup_drains_rows_a_tailorless_worker_cannot_run(session_factory, session, clock):
+    stuck_tailor = _seed(session, "ron", stage=STAGE_TAILOR, score=82, outcome="matched",
+                         pdf_path="/data/output/ron/1-stripe.pdf", page_overflow=True)
+    stuck_render = _seed(session, "cousin", stage=STAGE_RENDER, score=90, outcome="matched")
+    scoring = _seed(session, "dana", stage=STAGE_SCORE)
+    w = _worker(session_factory, FakeSender(), clock, users=(RON, COUSIN, DANA))   # no tailor client
+    w.startup()
+    for ev in (stuck_tailor, stuck_render, scoring):
+        session.refresh(ev)
+    assert stuck_tailor.stage == stuck_render.stage == STAGE_DELIVER
+    assert scoring.stage == STAGE_SCORE                       # other stages are left alone
+    assert stuck_tailor.pdf_path is None and stuck_tailor.page_overflow is False
+    assert "not configured" in stuck_tailor.resume_error
+    assert stuck_tailor.outcome == "matched"                  # still write-once
+
+
+def test_startup_is_a_no_op_when_tailoring_is_configured(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+    _worker_t(session_factory, FakeTailor(), clock, tmp_path).startup()
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
+```
 
 Keep `build(..., llm=None, cvs=None)`'s injectability and add `tailor=None` the same way, so tests can pass fakes.
 
@@ -2270,6 +2341,14 @@ SELECT page_overflow, COUNT(*) FROM evaluations WHERE pdf_path IS NOT NULL GROUP
 SELECT tailor_model, COUNT(*) FROM evaluations WHERE tailor_model IS NOT NULL GROUP BY 1;
 ```
 
+- **Rolling back to a Plan 3 image strands in-flight rows.** A Plan 3 worker has no `tailor` or
+  `render` selector at all, so rows sitting at those stages are invisible to it — the drain lives in
+  Plan 4's code and cannot help from an older image. Before rolling back, run:
+```sql
+UPDATE evaluations SET stage='deliver', attempts=0, pdf_path=NULL, page_overflow=0,
+       resume_error='rolled back before the resume was built', next_attempt_at=datetime('now')
+WHERE stage IN ('tailor','render');
+```
 - A line under the existing calibration note: the tailor prompt is separate from `SCORE_SYSTEM`, so calibration-week rubric changes do not touch it.
 - Manual re-render of one row (after fixing a template) — the stored selection is reused, no LLM call:
 ```sql
@@ -2318,11 +2397,22 @@ accepted; each is folded into the task that owns it, not bolted on at the end.
 | 1 | An unreadable (not merely missing) PDF made `send_message` return `invalid`, which `deliver()` retries forever — there is no delivery give-up by design. | Task 5 returns a distinct `"attachment"` kind; Task 7's `deliver()` drops the attachment and sends the score message. |
 | 2 | `_give_up_resume` left `pdf_path` set, so a re-scored row could attach the **previous** run's PDF under a new score — and a set `pdf_path` also suppressed the "couldn't generate resume" notice. | Task 7 clears `pdf_path`/`page_overflow`; Task 8's runbook clears every downstream artifact when re-scoring. |
 | 3 | The tailor cooldown keyed on `result.model`. Through a re-ask whose first call succeeded and whose second returned 401, that is the backend's model name, not the configured alias — so the worker paused a key `_llm_paused` never reads. | Task 6 builds every pause key from the configured alias; response model names stay in the logs. |
-| 4 | "Never parked at a stage nothing can run" was not true for rows already queued at `tailor`/`render` when a process has no tailor client. | Task 8 adds `db.drain_resume_stages`, called from `build`. `LLM_TAILOR_MODEL` stays required — no disable flag was added. |
+| 4 | "Never parked at a stage nothing can run" was not true for rows already queued at `tailor`/`render` when a process has no tailor client. | Task 8 adds `db.drain_resume_stages`, called from `Worker.startup()` (see leftover 9 below). `LLM_TAILOR_MODEL` stays required — no disable flag was added. |
 | 5 | `cap_content` truncates the whole message last, so a long reasoning (nothing bounds `ScoreResponse.reasoning`) erased both notices — the difference between "apply with this PDF" and "apply with your master CV". | Task 5 rewrites `cap_content` with the reasoning as a truncatable `body`; header and tail always survive. |
 | 6 | The filtering tests selected one entry each, which the too-few-entries fallback replaces — so they asserted against their own rule. `cv_sample.yaml` has one experience and one project, which is what manufactured the collision. | Task 2 adds `tests/fixtures/cv_tailor.yaml` (3 experience, 4 projects) and those tests now select two entries; Task 6's `SELECTION` likewise. |
 | 7 | The renderer dropped each project's `link` and `demo`. | Task 4 renders both. |
 | 8 | `MAX_BULLETS_PER_ENTRY=0` disabled the per-entry stopping condition while still emptying the fallback slice. | Task 1 rejects anything below 1 at startup. |
+
+A second review pass found three leftovers in those fixes, now also folded in:
+
+| # | Leftover | Where it is now fixed |
+|---|---|---|
+| 9 | The drain sat in `build`, which constructs the tailor client itself — so its `is None` check could never fire, and a directly-constructed `Worker` bypassed `build` entirely. | Task 8 moves it to `Worker.startup()`, called from `run_forever()`, with tests that queue rows first. |
+| 10 | The new CV tests rebound the module-global `FIXTURE`, which `tests/test_cv.py:8` already defines and nine existing tests read — including one asserting `cv_sample.yaml`'s exact id set. | Task 2 uses `TAILOR_FIXTURE`. Also fixes `test_unknown_entry_is_dropped_with_a_warning`, the one selection test still passing a single entry into a rule that replaces it. |
+| 11 | `cap_content("head", [], "x" * 5000)` returned 5,000 characters, breaking the helper's own hard cap; and the "lists give way first" test used inputs summing to ~1,977 characters, so nothing truncated and it could not fail for the right reason. | Task 5 clamps an oversized tail and rewrites the test to overflow for real. Both, plus the four other cap tests, were executed against the proposed formatter before this revision. |
+
+The unreadable-PDF test no longer uses `chmod(0o000)` — CI runs as root, which reads the file
+anyway and would let the test fall through to a real HTTP request. It shadows `discord_client.open`.
 
 Two consequences worth stating plainly, because they are behaviour changes rather than fixes:
 
