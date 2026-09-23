@@ -10,7 +10,7 @@ from config import FEEDS
 from db import (
     FETCH_OK,
     FETCH_PENDING,
-    STAGE_DELIVER,
+    STAGE_SCORE,
     Evaluation,
     Feed,
     Job,
@@ -66,7 +66,7 @@ def test_evaluation_defaults(session):
     ev = Evaluation(job=job, user_id="ron")
     session.add_all([feed, job, ev])
     session.commit()
-    assert ev.stage == STAGE_DELIVER
+    assert ev.stage == STAGE_SCORE
     assert ev.outcome is None
     assert ev.attempts == 0
     assert ev.delivery_attempts == 0
@@ -200,3 +200,14 @@ def test_ensure_columns_refuses_non_nullable_column(tmp_path):
     # Attempt to ensure the non-nullable column exists should raise.
     with pytest.raises(RuntimeError, match="nullable"):
         ensure_columns(engine, metadata=ProbeBase.metadata)
+
+
+def test_evaluation_defaults_to_score_stage_with_score_columns(session):
+    feed = Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed)
+    ev = Evaluation(job=job, user_id="ron")
+    session.add_all([feed, job, ev])
+    session.commit()
+    assert ev.stage == STAGE_SCORE
+    assert ev.score_model is None
+    assert ev.score_usage is None

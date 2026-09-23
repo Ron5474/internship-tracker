@@ -1,0 +1,36 @@
+name: Test Person
+contact:
+  email: t@example.com
+  phone: "+1 555 0100"
+  location: San Jose, CA
+  linkedin: https://www.linkedin.com/in/test/
+  github: https://github.com/test
+summary: null
+education:
+  - id: edu1
+    school: Test University
+    degree: BS Computer Science
+    dates: 2021 – 2025
+    details: ["GPA 3.9"]
+experience:
+  - id: exp1
+    company: Acme
+    title: SWE Intern
+    dates: 2024
+    location: Remote
+    bullets:
+      - {id: exp1.b1, text: "Built a FastAPI service handling 1k rps."}
+      - {id: exp1.b2, text: "Wrote SQLAlchemy migrations."}
+projects:
+  - id: proj1
+    name: Tracker
+    dates: Jun 2026
+    tech: [Python, SQLite]
+    link: https://github.com/test/tracker
+    demo: https://tracker.example.com
+    bullets:
+      - {id: proj1.b1, text: "Polls GitHub and posts to Discord."}
+skills:
+  languages: [Python, Go]
+  frameworks: [FastAPI]
+  tools: [Docker, SQLite]

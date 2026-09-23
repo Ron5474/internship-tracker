@@ -149,3 +149,27 @@ def test_send_with_pdf_uses_multipart(tmp_path):
 def test_delivery_result_ok_property():
     assert DeliveryResult("ok", None, None).ok
     assert not DeliveryResult("transient", None, None).ok
+
+
+# --- format_match -----------------------------------------------------------
+
+from discord_client import format_match
+
+
+def test_format_match_full():
+    msg = format_match("Stripe", "SWE Intern", "SF", "https://s/j?gh_jid=1", 82, "Strong Python match.",
+                       ["Kubernetes"], ["work authorization"], matched=True)
+    assert msg == ("🎯 82% — **Stripe** — SWE Intern\n📍 SF\n🔗 https://s/j?gh_jid=1\n✅ Why: Strong Python match.\n"
+                   "⚠️ Gaps: Kubernetes\n❓ Not on CV: work authorization")
+
+
+def test_format_match_below_threshold_icon_and_omits_empty_lists():
+    msg = format_match("Stripe", "SWE Intern", "SF", "https://s", 41, "Different discipline.", [], [], matched=False)
+    assert msg.startswith("📉 41% — **Stripe**")
+    assert "Gaps" not in msg and "Not on CV" not in msg
+
+
+def test_format_match_caps_at_2000_truncating_lists_first():
+    gaps = [f"requirement number {i}" for i in range(300)]
+    msg = format_match("S", "R", "L", "https://s", 70, "Why.", gaps, [], matched=True)
+    assert len(msg) <= MAX_CONTENT and "✅ Why: Why." in msg and "…" in msg

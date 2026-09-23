@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from config import FeedSpec
-from db import Evaluation, Feed, Job
+from db import STAGE_SCORE, Evaluation, Feed, Job
 from parser import parse_sections, url_key
 from users import User
 
@@ -74,4 +74,4 @@ def poll_feed(
 
 
 def _evaluations_for(job: Job, feed_name: str, section: str, users: list[User]) -> list[Evaluation]:
-    return [Evaluation(job=job, user_id=u.id) for u in users if u.wants(feed_name, section)]
+    return [Evaluation(job=job, user_id=u.id, stage=STAGE_SCORE) for u in users if u.wants(feed_name, section)]

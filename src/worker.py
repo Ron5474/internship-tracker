@@ -3,11 +3,14 @@ import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 
+from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
 
-from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Job, utcnow
-from discord_client import DeliveryResult, format_link_only, send_message
+from cv import MasterCV, cv_to_text
+from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, STAGE_SCORE, Evaluation, Job, utcnow
+from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
+from llm import LLMResult
 from users import User
 
 log = logging.getLogger(__name__)
@@ -17,10 +20,13 @@ DELIVERY_BUDGET = 10
 FETCH_BUDGET = 5
 FETCH_MAX_AGE_HOURS = 24
 FETCH_GAP_SECONDS = 2
+SCORE_BUDGET = 3
+LLM_PAUSE_SECONDS = 900
+INVALID_STREAK_LIMIT = 3
 
 _LINK_ONLY_NOTES = {
     "fetch_failed": "couldn't read the description",
-    "score_failed": "couldn't read the description",
+    "score_failed": "couldn't score",
 }
 
 
@@ -31,6 +37,9 @@ def backoff(attempt: int) -> int:
 
 def message_for(ev: Evaluation) -> str:
     job = ev.job
+    if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
+        return format_match(job.company, job.role, job.location, job.url, ev.score, ev.reasoning or "",
+                            ev.missing_confirmed or [], ev.missing_unknown or [], matched=ev.outcome == "matched")
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
 
@@ -39,16 +48,21 @@ class Worker:
         self,
         session_factory: sessionmaker,
         users: list[User],
+        cvs: dict[str, dict] | None = None,
+        llm=None,
         send: Callable[..., DeliveryResult] = send_message,
         fetch: Callable[[str], FetchResult] = fetch_description,
         now: Callable[[], datetime] = utcnow,
     ) -> None:
         self._sessions = session_factory
         self._users = {u.id: u for u in users}
+        self._cvs = dict(cvs or {})
+        self._llm = llm
         self._send = send
         self._fetch = fetch
         self._now = now
         self._fetch_not_before: datetime | None = None
+        self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -86,18 +100,24 @@ class Worker:
                 time.sleep(idle_sleep)
 
     def run_once(self) -> bool:
+        # Ready messages first, then the cheap fetch, then the slow LLM call.
         with self._sessions() as session:
+            ev = self._next_deliverable(session)
+            if ev is not None:
+                self.deliver(session, ev)
+                session.commit()
+                return True
             job = self._next_fetchable(session)
             if job is not None:
                 self.fetch(session, job)
                 session.commit()
                 return True
-            ev = self._next_deliverable(session)
-            if ev is None:
-                return False
-            self.deliver(session, ev)
-            session.commit()
-            return True
+            ev = self._next_scoreable(session)
+            if ev is not None:
+                self.score(session, ev)
+                session.commit()
+                return True
+            return False
 
     def _next_fetchable(self, session: Session) -> Job | None:
         now = self._now()
@@ -121,6 +141,22 @@ class Worker:
                 Evaluation.next_attempt_at <= now,
                 Job.fetch_status != FETCH_PENDING,
             )
+            .order_by(Evaluation.next_attempt_at, Evaluation.id)
+            .all()
+        )
+        for ev in candidates:
+            if not self.is_paused(f"discord:{ev.user_id}"):
+                return ev
+        return None
+
+    def _next_scoreable(self, session: Session) -> Evaluation | None:
+        if self._llm is None or self.is_paused("llm"):
+            return None
+        now = self._now()
+        candidates = (
+            session.query(Evaluation)
+            .join(Job)
+            .filter(Evaluation.stage == STAGE_SCORE, Evaluation.next_attempt_at <= now, Job.fetch_status == FETCH_OK)
             .order_by(Evaluation.next_attempt_at, Evaluation.id)
             .all()
         )
@@ -182,9 +218,120 @@ class Worker:
     def _fail_fetch(self, session: Session, job: Job) -> None:
         job.fetch_status = FETCH_FAILED
         for ev in job.evaluations:
-            if ev.stage != STAGE_CLOSED and ev.outcome is None:
+            if ev.stage == STAGE_CLOSED:
+                continue
+            if ev.outcome is None:
                 ev.outcome = "fetch_failed"
+            if ev.stage == STAGE_SCORE:
+                ev.stage = STAGE_DELIVER   # nothing to score; deliver the link
         log.warning("Job %d (%s — %s) description unavailable: %s", job.id, job.company, job.role, job.fetch_error)
+
+    # -- score stage --------------------------------------------------------
+
+    def score(self, session: Session, ev: Evaluation) -> None:
+        user = self._users.get(ev.user_id)
+        if user is None or ev.user_id not in self._cvs:
+            self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml / no CV loaded")
+            return
+
+        now = self._now()
+        if ev.attempts >= SCORE_BUDGET:
+            # Crashed attempts can leave the row at the budget with no result: no further call.
+            self._give_up_scoring(ev, now, f"budget exhausted after {ev.attempts} attempts")
+            return
+        if ev.cv_snapshot is None:
+            ev.cv_snapshot = self._cvs[ev.user_id]
+        try:
+            cv_text = cv_to_text(MasterCV.model_validate(ev.cv_snapshot))
+        except ValidationError as e:
+            # A hand-edited or pre-schema snapshot: no call would be meaningful, and no lease is owed.
+            self._give_up_scoring(ev, now, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:300]}")
+            return
+        # Lease the attempt before the (slow, crash-prone) call, like fetch.
+        ev.attempts += 1
+        ev.next_attempt_at = now + timedelta(seconds=backoff(ev.attempts))
+        session.commit()
+
+        description = (ev.job.description or "")[:DESCRIPTION_CAP]
+        try:
+            result = self._llm.score(description, cv_text)
+        except Exception as e:  # noqa: BLE001 — a client bug is a failed attempt, not a dead worker
+            log.exception("LLM client raised for evaluation %d", ev.id)
+            result = LLMResult("transient", None, f"{type(e).__name__}: {e}", None, None, None, 0)
+        after = self._now()   # deadlines below are measured from when the call came back
+
+        usage = result.usage or {}
+        outcome = self._score_outcome(result, user)
+        log.info("score ev=%d user=%s model=%s outcome=%s score=%s ms=%d tokens=%s/%s%s",
+                 ev.id, ev.user_id, result.model or self._llm_model_name(), outcome,
+                 result.data.score if outcome in ("matched", "below_threshold") else "-", result.ms,
+                 usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
+                 f" error={result.error}" if result.error else "")
+
+        if result.kind == "invalid":
+            self._invalid_streak += 1
+            if self._invalid_streak >= INVALID_STREAK_LIMIT:
+                self._invalid_streak = 0
+                self._pause("llm", after + timedelta(seconds=LLM_PAUSE_SECONDS),
+                            f"{INVALID_STREAK_LIMIT} consecutive invalid replies — model/schema mismatch?")
+        else:
+            self._invalid_streak = 0
+
+        if result.ok and result.data.posting_usable is False:
+            # The model read an error page / login wall, not a posting: nothing to score, deliver the link.
+            self._give_up_scoring(ev, after, "posting not usable per model")
+            return
+
+        if result.ok:
+            data = result.data
+            ev.score, ev.reasoning = data.score, data.reasoning
+            ev.missing_confirmed, ev.missing_unknown = data.missing_confirmed, data.missing_unknown
+            ev.score_model, ev.score_usage = result.model, result.usage
+            ev.last_error = None
+            if data.score >= user.threshold:
+                ev.outcome, ev.stage = "matched", STAGE_DELIVER
+            else:
+                ev.outcome = "below_threshold"
+                ev.stage = STAGE_DELIVER if user.notify_below_threshold else STAGE_CLOSED
+            ev.next_attempt_at = after
+            return
+
+        if result.kind == "unavailable":
+            # Outage or config problem: not this row's fault. Give the lease back and hold every row.
+            ev.attempts -= 1
+            resume = after + timedelta(seconds=LLM_PAUSE_SECONDS)
+            ev.next_attempt_at = resume
+            self._pause("llm", resume, result.error or "unavailable")
+            return
+
+        ev.last_error = result.error
+        delay = result.retry_after if result.retry_after is not None else backoff(ev.attempts)
+        delay = max(delay, 1)   # Retry-After: 0 must not schedule an immediate retry
+        if result.kind == "transient":
+            # A 429/5xx/timeout says the shared endpoint is unwell: hold every other row for the
+            # backoff — even when this row is about to give up and be delivered link-only.
+            self._pause("llm", after + timedelta(seconds=delay), result.error or result.kind)
+        if ev.attempts >= SCORE_BUDGET:
+            self._give_up_scoring(ev, after, result.error or result.kind)
+            return
+        ev.next_attempt_at = after + timedelta(seconds=delay)
+
+    def _give_up_scoring(self, ev: Evaluation, when: datetime, why: str) -> None:
+        ev.last_error = why
+        ev.outcome, ev.stage = "score_failed", STAGE_DELIVER
+        ev.next_attempt_at = when
+        log.warning("Evaluation %d: scoring gave up after %d attempts: %s", ev.id, ev.attempts, why)
+
+    def _llm_model_name(self) -> str:
+        return getattr(self._llm, "model", "?")
+
+    @staticmethod
+    def _score_outcome(result: LLMResult, user: User) -> str:
+        if not result.ok:
+            return result.kind
+        if result.data.posting_usable is False:
+            return "unusable"
+        return "matched" if result.data.score >= user.threshold else "below_threshold"
 
     # -- deliver stage ------------------------------------------------------
 

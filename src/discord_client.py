@@ -26,6 +26,23 @@ def format_link_only(company: str, role: str, location: str, url: str, note: str
     return f"{head}\n📍 {location}\n🔗 {url}"
 
 
+def format_match(
+    company: str, role: str, location: str, url: str,
+    score: int, reasoning: str, missing_confirmed: list[str], missing_unknown: list[str],
+    matched: bool,
+) -> str:
+    icon = "🎯" if matched else "📉"
+    header = f"{icon} {score}% — **{company}** — {role}\n📍 {location}\n🔗 {url}"
+    if reasoning:
+        header += f"\n✅ Why: {reasoning}"
+    lists = []
+    if missing_confirmed:
+        lists.append("⚠️ Gaps: " + ", ".join(missing_confirmed))
+    if missing_unknown:
+        lists.append("❓ Not on CV: " + ", ".join(missing_unknown))
+    return cap_content(header, lists)
+
+
 def cap_content(header: str, lists: list[str], tail: str = "") -> str:
     """Join header + list lines + tail under MAX_CONTENT.
 

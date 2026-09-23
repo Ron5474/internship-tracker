@@ -4,3 +4,6 @@
   feeds: [internships, new-grad]
   sections: [software engineering, data science]
   threshold: 60
+  # Calibration: true delivers below-threshold postings too, with their score, so you can
+  # judge the scoring. Set false once you trust it.
+  notify_below_threshold: false
