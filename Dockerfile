@@ -12,6 +12,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
+# Diagnostics run with `docker compose exec`, where the endpoint and the database are both
+# reachable. They are never started by the daemon — see scripts/README.md.
+COPY scripts/ ./scripts/
 
 ENV PYTHONPATH=/app/src
 
