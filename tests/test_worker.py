@@ -979,10 +979,11 @@ def _worker_t(session_factory, tailor, clock, output_dir, cvs=None, users=(RON, 
                   fetch=FakeFetcher(), now=clock)
 
 
-def _worker_st(session_factory, llm, tailor, clock, output_dir, cvs=None, users=(RON, COUSIN), send=None):
+def _worker_st(session_factory, llm, tailor, clock, output_dir, render=None, cvs=None,
+               users=(RON, COUSIN), send=None):
     return Worker(session_factory, list(users), cvs=cvs if cvs is not None else CVS,
-                  llm=llm, tailor=tailor, output_dir=str(output_dir), send=send or FakeSender(),
-                  fetch=FakeFetcher(), now=clock)
+                  llm=llm, tailor=tailor, output_dir=str(output_dir), render=render or FakeRenderer(1),
+                  send=send or FakeSender(), fetch=FakeFetcher(), now=clock)
 
 
 def test_tailor_stores_the_validated_selection_and_moves_to_render(session_factory, session, clock, tmp_path):
@@ -1112,3 +1113,206 @@ def test_tailor_skipped_while_the_users_webhook_is_paused(session_factory, sessi
     w = _worker_t(session_factory, tailor, clock, tmp_path)
     w._pause("discord:ron", None, "gone")
     assert w.run_once() is False and tailor.calls == []    # no tokens spent on an undeliverable row
+
+
+# --- render and delivery of the PDF -----------------------------------------
+
+from worker import RENDER_BUDGET
+
+
+class FakeRenderer:
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def __call__(self, cv, selection, out_path):
+        self.calls.append((cv, selection, out_path))
+        r = self.results.pop(0) if self.results else 1
+        if isinstance(r, Exception):
+            raise r
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"%PDF-1.7 stub")
+        from render import RenderResult
+        return RenderResult(out_path, r)
+
+
+def _seed_renderable(session, user_id="ron", **kw):
+    ev = _seed(session, user_id, stage=STAGE_RENDER, score=82, outcome="matched",
+               cv_snapshot=CV_SNAPSHOT, tailored=SELECTION, **kw)
+    return _resolve(session, ev)
+
+
+def _worker_r(session_factory, renderer, clock, tmp_path, cvs=None, users=(RON, COUSIN), sender=None):
+    return Worker(session_factory, list(users), cvs=cvs or {u.id: CV_SNAPSHOT for u in users},
+                  output_dir=str(tmp_path), render=renderer, now=clock, send=sender or FakeSender())
+
+
+def test_render_writes_the_pdf_and_moves_to_deliver(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    renderer = FakeRenderer(1)
+    w = _worker_r(session_factory, renderer, clock, tmp_path)
+    assert w.run_once() is True
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER and ev.attempts == 0
+    assert ev.pdf_path.endswith("/ron/%d-stripe.pdf" % ev.job_id)
+    assert Path(ev.pdf_path).read_bytes().startswith(b"%PDF")
+    assert ev.page_overflow is False and ev.resume_error is None
+
+
+def test_two_page_render_sets_overflow_and_keeps_the_pdf(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    _worker_r(session_factory, FakeRenderer(2), clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.page_overflow is True and ev.stage == STAGE_DELIVER and Path(ev.pdf_path).exists()
+
+
+def test_render_uses_the_snapshot_and_the_stored_selection(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    renderer = FakeRenderer(1)
+    _worker_r(session_factory, renderer, clock, tmp_path,
+              cvs={"ron": {**CV_SNAPSHOT, "name": "Live Person"}}).run_once()
+    rendered_cv, selection, _ = renderer.calls[0]
+    assert rendered_cv.name == CV_SNAPSHOT["name"] != "Live Person"
+    assert selection == SELECTION            # no second LLM call after a crash
+
+
+def test_render_failure_retries_then_gives_up_with_the_score_message(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    w = _worker_r(session_factory, FakeRenderer(RuntimeError("pango exploded"),
+                                                RuntimeError("pango exploded")), clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_RENDER and ev.attempts == 1
+    clock.advance(BACKOFF_SECONDS[1])
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER and ev.pdf_path is None
+    assert "pango exploded" in ev.resume_error and ev.outcome == "matched"
+    assert ev.attempts == 0
+
+
+def test_render_over_budget_on_restart_makes_no_call(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session, attempts=RENDER_BUDGET)
+    renderer = FakeRenderer(1)
+    _worker_r(session_factory, renderer, clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert renderer.calls == [] and ev.stage == STAGE_DELIVER and "budget" in ev.resume_error
+
+
+def test_render_leases_the_attempt_before_the_call(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    _worker_r(session_factory, FakeRenderer(RuntimeError("boom")), clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.attempts == 1
+
+
+def test_delivery_attaches_the_pdf_and_closes(session_factory, session, clock, tmp_path):
+    pdf = tmp_path / "ron" / "1-stripe.pdf"
+    pdf.parent.mkdir(parents=True)
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched", pdf_path=str(pdf))
+    _resolve(session, ev)
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()
+    session.refresh(ev)
+    assert sender.calls[0][2] == str(pdf) and ev.stage == STAGE_CLOSED
+
+
+def test_delivery_retry_reuses_the_same_pdf(session_factory, session, clock, tmp_path):
+    pdf = tmp_path / "r.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched", pdf_path=str(pdf))
+    _resolve(session, ev)
+    sender = FakeSender(DeliveryResult("transient", None, "503"), OK)
+    w = _worker(session_factory, sender, clock)
+    w.run_once()
+    clock.advance(3600)
+    w.run_once()
+    session.refresh(ev)
+    assert [c[2] for c in sender.calls] == [str(pdf), str(pdf)]
+    assert ev.stage == STAGE_CLOSED and Path(pdf).exists()
+
+
+def test_an_unreadable_pdf_degrades_to_the_score_message(session_factory, session, clock, tmp_path):
+    # exists() is true and open() fails: the path Task 7's precheck cannot see.
+    pdf = tmp_path / "locked.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path=str(pdf))
+    _resolve(session, ev)
+    sender = FakeSender(DeliveryResult("attachment", None, f"cannot read {pdf}: denied"), OK)
+    w = _worker(session_factory, sender, clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.pdf_path is None and ev.delivery_attempts == 0    # nothing was sent, nothing counted
+    assert ev.stage == STAGE_DELIVER
+    w.run_once()
+    session.refresh(ev)
+    assert sender.calls[1][2] is None and "Couldn't generate resume" in sender.calls[1][1]
+    assert ev.stage == STAGE_CLOSED
+
+
+def test_a_vanished_pdf_degrades_to_the_score_message(session_factory, session, clock, tmp_path):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path=str(tmp_path / "gone.pdf"))
+    _resolve(session, ev)
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()
+    session.refresh(ev)
+    assert sender.calls[0][2] is None
+    assert "Couldn't generate resume" in sender.calls[0][1]
+    assert ev.stage == STAGE_CLOSED
+
+
+def test_message_for_a_match_without_a_resume_carries_the_note(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", resume_error="tailor budget exhausted")
+    assert "Couldn't generate resume" in message_for(ev)
+    assert message_for(ev).startswith("🎯 82%")
+
+
+def test_message_for_an_overflowing_resume_says_so(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path="/x/r.pdf", page_overflow=True)
+    assert "ran over one page" in message_for(ev)
+
+
+def test_below_threshold_message_has_no_resume_note(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=40, outcome="below_threshold", reasoning="why")
+    msg = message_for(ev)
+    assert "Couldn't generate resume" not in msg and msg.startswith("📉 40%")
+
+
+def test_deliver_runs_before_render(session_factory, session, clock, tmp_path):
+    # A ready message and a ready render, both due now: the message goes first.
+    delivered = _seed(session, "ron", stage=STAGE_DELIVER, score=80, outcome="matched")
+    _resolve(session, delivered)
+    to_render = _seed_renderable(session, "cousin")
+    sender, renderer = FakeSender(OK), FakeRenderer(1)
+    w = _worker_r(session_factory, renderer, clock, tmp_path, sender=sender)
+    w.run_once()
+    assert len(sender.calls) == 1 and renderer.calls == []
+    w.run_once()
+    assert len(renderer.calls) == 1
+    session.refresh(delivered); session.refresh(to_render)
+    assert delivered.stage == STAGE_CLOSED and to_render.stage == STAGE_DELIVER
+
+
+def test_render_runs_before_score(session_factory, session, clock, tmp_path):
+    # Local CPU work drains before the paid call.
+    _seed_scoreable(session, "ron")
+    _seed_renderable(session, "cousin")
+    llm, renderer = FakeLLM(_llm_ok()), FakeRenderer(1)
+    w = _worker_st(session_factory, llm, FakeTailor(), clock, tmp_path, render=renderer)
+    w.run_once()
+    assert len(renderer.calls) == 1 and len(llm.calls) == 0
+
+
+def test_score_runs_before_tailor(session_factory, session, clock, tmp_path):
+    # The cheap model's queue drains before the expensive one's.
+    _seed_scoreable(session, "ron")
+    _seed_tailorable(session, "cousin")
+    llm, tailor = FakeLLM(_llm_ok()), FakeTailor()
+    w = _worker_st(session_factory, llm, tailor, clock, tmp_path)
+    w.run_once()
+    assert len(llm.calls) == 1 and tailor.calls == []

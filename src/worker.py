@@ -2,6 +2,7 @@ import logging
 import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from pydantic import ValidationError
 from sqlalchemy.orm import Session, sessionmaker
@@ -23,6 +24,7 @@ from db import (
 from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from llm import LLMResult
+from render import output_path, render_pdf
 from users import User
 
 log = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ FETCH_MAX_AGE_HOURS = 24
 FETCH_GAP_SECONDS = 2
 SCORE_BUDGET = 3
 TAILOR_BUDGET = 3
+RENDER_BUDGET = 2
 LLM_PAUSE_SECONDS = 900
 INVALID_STREAK_LIMIT = 3
 
@@ -51,8 +54,14 @@ def backoff(attempt: int) -> int:
 def message_for(ev: Evaluation) -> str:
     job = ev.job
     if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
-        return format_match(job.company, job.role, job.location, job.url, ev.score, ev.reasoning or "",
-                            ev.missing_confirmed or [], ev.missing_unknown or [], matched=ev.outcome == "matched")
+        return format_match(
+            job.company, job.role, job.location, job.url, ev.score, ev.reasoning or "",
+            ev.missing_confirmed or [], ev.missing_unknown or [],
+            matched=ev.outcome == "matched",
+            overflow=bool(ev.page_overflow and ev.pdf_path),
+            # Only a match promises a resume; a below-threshold notice never had one.
+            resume_missing=ev.outcome == "matched" and ev.pdf_path is None and ev.resume_error is not None,
+        )
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
 
@@ -64,6 +73,7 @@ class Worker:
         cvs: dict[str, dict] | None = None,
         llm=None,
         tailor=None,
+        render: Callable[..., "RenderResult"] = render_pdf,
         output_dir: str | None = None,
         max_bullets: int = 4,
         send: Callable[..., DeliveryResult] = send_message,
@@ -75,6 +85,7 @@ class Worker:
         self._cvs = dict(cvs or {})
         self._llm = llm
         self._tailor = tailor
+        self._render = render
         self._output_dir = output_dir
         self._max_bullets = max_bullets
         self._send = send
@@ -132,7 +143,8 @@ class Worker:
                 time.sleep(idle_sleep)
 
     def run_once(self) -> bool:
-        # Ready messages first, then the cheap fetch, then the slow LLM call.
+        # Ready messages first, then cheap network, then local CPU, then the cheap LLM
+        # call, then the expensive one.
         with self._sessions() as session:
             ev = self._next_deliverable(session)
             if ev is not None:
@@ -142,6 +154,11 @@ class Worker:
             job = self._next_fetchable(session)
             if job is not None:
                 self.fetch(session, job)
+                session.commit()
+                return True
+            ev = self._next_renderable(session)
+            if ev is not None:
+                self.render(session, ev)
                 session.commit()
                 return True
             ev = self._next_scoreable(session)
@@ -369,6 +386,60 @@ class Worker:
             return "unusable"
         return "matched" if result.data.score >= user.threshold else "below_threshold"
 
+    # -- render stage ---------------------------------------------------------
+
+    def _next_renderable(self, session: Session) -> Evaluation | None:
+        if self._output_dir is None:
+            return None
+        now = self._now()
+        candidates = (
+            session.query(Evaluation)
+            .filter(Evaluation.stage == STAGE_RENDER, Evaluation.next_attempt_at <= now)
+            .order_by(Evaluation.next_attempt_at, Evaluation.id)
+            .all()
+        )
+        for ev in candidates:
+            if not self.is_paused(f"discord:{ev.user_id}"):
+                return ev
+        return None
+
+    def render(self, session: Session, ev: Evaluation) -> None:
+        now = self._now()
+        if ev.attempts >= RENDER_BUDGET:
+            self._give_up_resume(ev, now, f"render budget exhausted after {ev.attempts} attempts")
+            return
+        try:
+            cv = MasterCV.model_validate(ev.cv_snapshot)
+        except ValidationError as e:
+            self._give_up_resume(ev, now, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:200]}")
+            return
+        if not ev.tailored:
+            self._give_up_resume(ev, now, "no tailored selection to render")
+            return
+
+        ev.attempts += 1
+        ev.next_attempt_at = now + timedelta(seconds=backoff(ev.attempts))
+        session.commit()        # WeasyPrint can hang or be OOM-killed; the attempt must be durable
+
+        out = output_path(self._output_dir, ev.user_id, ev.job_id, ev.job.company)
+        try:
+            result = self._render(cv, ev.tailored, out)
+        except Exception as e:  # noqa: BLE001 — a bad glyph or a full disk is a failed attempt
+            log.exception("Render failed for evaluation %d", ev.id)
+            after = self._now()
+            if ev.attempts >= RENDER_BUDGET:
+                self._give_up_resume(ev, after, f"{type(e).__name__}: {e}")
+            else:
+                ev.last_error = f"{type(e).__name__}: {e}"
+                ev.next_attempt_at = after + timedelta(seconds=backoff(ev.attempts))
+            return
+
+        after = self._now()
+        ev.pdf_path, ev.page_overflow = result.path, result.overflow
+        ev.stage, ev.attempts, ev.next_attempt_at = STAGE_DELIVER, 0, after
+        log.info("render ev=%d user=%s pages=%d overflow=%s path=%s",
+                 ev.id, ev.user_id, result.pages, result.overflow, result.path)
+
     # -- tailor stage ---------------------------------------------------------
 
     def _next_tailorable(self, session: Session) -> Evaluation | None:
@@ -462,6 +533,12 @@ class Worker:
             self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml")
             return
 
+        if ev.pdf_path and not Path(ev.pdf_path).exists():
+            # The volume was wiped or the file was cleaned up: send what we still have.
+            log.warning("Evaluation %d: resume %s is gone; delivering without it", ev.id, ev.pdf_path)
+            ev.resume_error = ev.resume_error or "resume file missing at delivery"
+            ev.pdf_path = None
+
         try:
             result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
@@ -478,6 +555,16 @@ class Worker:
         if result.kind == "gone":
             # Discord says stop using this webhook. Whole destination waits for a fixed config + restart.
             self._pause(f"discord:{ev.user_id}", None, result.error or "webhook gone")
+            return
+
+        if result.kind == "attachment":
+            # No exists() check can cover permissions or a race with a cleanup. The message itself
+            # is fine: drop the attachment and send it on the next pass rather than looping on a
+            # file that will never open. No delivery attempt is counted — nothing was sent.
+            log.warning("Evaluation %d: %s; delivering without the resume", ev.id, result.error)
+            ev.resume_error = ev.resume_error or result.error
+            ev.pdf_path, ev.page_overflow = None, False
+            ev.next_attempt_at = self._now()
             return
 
         ev.delivery_attempts += 1
