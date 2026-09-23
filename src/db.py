@@ -181,6 +181,22 @@ def import_legacy_state(session: Session, data_dir: str) -> int:
     return len(known)
 
 
+def drain_resume_stages(session: Session) -> int:
+    """Move rows queued for tailoring or rendering to delivery.
+
+    Called from Worker.startup() when this process has no tailor client or no output directory.
+    Those rows were queued by a process that did, and nothing here will ever pick them up; without
+    this they sit at their stage forever while the user waits for a notification already paid for.
+    """
+    rows = session.query(Evaluation).filter(Evaluation.stage.in_((STAGE_TAILOR, STAGE_RENDER))).all()
+    for ev in rows:
+        ev.resume_error = ev.resume_error or "tailoring not configured in this process"
+        ev.stage, ev.attempts = STAGE_DELIVER, 0
+        ev.pdf_path, ev.page_overflow = None, False
+        ev.next_attempt_at = utcnow()
+    return len(rows)
+
+
 def ensure_columns(engine: Engine, metadata: MetaData = Base.metadata) -> list[str]:
     """Add columns that exist in the models but not in an existing database.
 

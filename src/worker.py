@@ -19,6 +19,7 @@ from db import (
     STAGE_TAILOR,
     Evaluation,
     Job,
+    drain_resume_stages,
     utcnow,
 )
 from discord_client import DeliveryResult, format_link_only, format_match, send_message
@@ -132,7 +133,23 @@ class Worker:
 
     # -- loop ---------------------------------------------------------------
 
+    def startup(self) -> None:
+        """One-time work before the loop.
+
+        Rows queued for tailoring or rendering by a process that had a tailor client would sit
+        forever in one that does not. Move them to delivery so the score still reaches the user.
+        """
+        if self._tailoring_enabled:
+            return
+        with self._sessions() as session:
+            drained = drain_resume_stages(session)
+            session.commit()
+        if drained:
+            log.warning("Tailoring not configured: %d queued row(s) will be delivered "
+                        "with the score only", drained)
+
     def run_forever(self, idle_sleep: float = 3.0) -> None:
+        self.startup()
         while True:
             try:
                 did_work = self.run_once()

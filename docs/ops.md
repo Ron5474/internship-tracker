@@ -116,11 +116,79 @@ FROM evaluations e JOIN jobs j ON j.id = e.job_id
 WHERE j.company LIKE '%X%' ORDER BY e.id DESC;
 ```
 
-Re-score one evaluation by hand (e.g. after a prompt change):
+**Re-scoring a row (after a CV, prompt or rubric change) must clear every downstream artifact.** A bare `stage='score'` leaves the previous run's selection and PDF attached, and if tailoring then fails the row ships the old resume under the new score:
 
 ```sql
-UPDATE evaluations SET stage='score', outcome=NULL, score=NULL, attempts=0, next_attempt_at=datetime('now')
-WHERE id = <evaluation id>;
+UPDATE evaluations SET stage='score', outcome=NULL, attempts=0,
+       cv_snapshot=NULL, tailored=NULL, pdf_path=NULL, page_overflow=0, resume_error=NULL,
+       score=NULL, reasoning=NULL, missing_confirmed=NULL, missing_unknown=NULL,
+       next_attempt_at=datetime('now') WHERE id = <evaluation id>;
 ```
 
-As written this reuses the stored `cv_snapshot`, which is what you want after a prompt change — the same CV, the new rubric. To pick up a CV edit instead, add `cv_snapshot=NULL` to the SET list so the row re-snapshots the CV loaded at startup (edit the file, restart, then re-score).
+`cv_snapshot=NULL` is what makes the re-score read the edited CV; leaving it set re-scores against the old one — harmless after a prompt change (same CV, new rubric), wrong after a CV edit.
+
+## Deploying Plan 4
+
+1. **Server prep.** Add `LLM_TAILOR_MODEL=deepseek-v4-pro` and `MAX_BULLETS_PER_ENTRY=4` to `~/deployed-projects/internship-tracker/.env`; the container creates `data/output/<user>/` itself. Confirm the alias exists:
+
+```bash
+curl -s -H "Authorization: Bearer $LLM_API_KEY" $LLM_BASE_URL/models | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin)['data']])"
+```
+
+2. **Expected first-boot lines:**
+
+```
+Schema upgraded: added evaluations.resume_error, evaluations.tailor_model
+Scoring with deepseek-v4-flash, tailoring with deepseek-v4-pro at ...
+```
+
+3. **Watch the logs:**
+
+```bash
+docker compose logs -f internship-tracker | grep -E "tailor ev=|render ev=|Delivered|ERROR"
+```
+
+4. **Measurement queries:**
+
+```sql
+-- how often a match actually ships with a resume
+SELECT CASE WHEN pdf_path IS NOT NULL THEN 'with pdf' ELSE 'no pdf' END AS kind,
+       COUNT(*) FROM evaluations WHERE outcome='matched' GROUP BY kind;
+
+-- why resumes are missing
+SELECT substr(resume_error,1,60), COUNT(*) FROM evaluations
+WHERE resume_error IS NOT NULL GROUP BY 1 ORDER BY 2 DESC;
+
+-- one-page rate
+SELECT page_overflow, COUNT(*) FROM evaluations WHERE pdf_path IS NOT NULL GROUP BY 1;
+
+-- tailoring spend
+SELECT tailor_model, COUNT(*) FROM evaluations WHERE tailor_model IS NOT NULL GROUP BY 1;
+```
+
+5. **Rolling back to a Plan 3 image strands in-flight rows.** A Plan 3 worker has no `tailor` or `render` selector at all, so rows sitting at those stages are invisible to it — the drain that would rescue them lives in Plan 4's code and cannot help from an older image. **Order matters — stop the worker first**, or an in-flight `run_once()` will lease a row and write its stage back over the reset:
+
+```bash
+docker compose stop internship-tracker
+```
+
+```sql
+UPDATE evaluations SET stage='deliver', attempts=0, pdf_path=NULL, page_overflow=0,
+       resume_error='rolled back before the resume was built', next_attempt_at=datetime('now')
+WHERE stage IN ('tailor','render');
+```
+
+```bash
+docker compose up -d      # now on the Plan 3 image
+```
+
+6. **Calibration week note.** The tailor prompt is separate from `SCORE_SYSTEM`, so calibration-week rubric changes (above) do not touch it.
+
+7. **Manual re-render of one row** (after fixing a template) — the stored selection is reused, no LLM call:
+
+```sql
+UPDATE evaluations SET stage='render', attempts=0, pdf_path=NULL, page_overflow=0,
+       resume_error=NULL, next_attempt_at=datetime('now') WHERE id = <id>;
+```
+
+8. **Re-scoring a row (after a CV or rubric change) must clear every downstream artifact**, not just `stage='score'` — see "Calibration week" above for why and the exact statement.

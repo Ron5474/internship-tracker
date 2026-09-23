@@ -1,5 +1,6 @@
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pytest
 
@@ -560,7 +561,7 @@ from cv import load_cv
 from llm import LLMResult, ScoreResponse
 from worker import INVALID_STREAK_LIMIT, LLM_PAUSE_SECONDS, SCORE_BUDGET
 
-CV_DICT = load_cv("tests/fixtures/cv_sample.yaml").model_dump()
+CV_DICT = load_cv(str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")).model_dump()
 CVS = {"ron": CV_DICT, "cousin": CV_DICT, "dana": CV_DICT}
 
 def _llm_ok(score=82):
@@ -929,8 +930,6 @@ def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, sess
 
 
 # --- tailor ------------------------------------------------------------------
-
-from pathlib import Path
 
 from db import STAGE_RENDER, STAGE_TAILOR
 from worker import TAILOR_BUDGET
@@ -1316,3 +1315,29 @@ def test_score_runs_before_tailor(session_factory, session, clock, tmp_path):
     w = _worker_st(session_factory, llm, tailor, clock, tmp_path)
     w.run_once()
     assert len(llm.calls) == 1 and tailor.calls == []
+
+
+# --- startup: draining rows a tailorless process cannot run -----------------
+
+
+def test_startup_drains_rows_a_tailorless_worker_cannot_run(session_factory, session, clock):
+    stuck_tailor = _seed(session, "ron", stage=STAGE_TAILOR, score=82, outcome="matched",
+                         pdf_path="/data/output/ron/1-stripe.pdf", page_overflow=True)
+    stuck_render = _seed(session, "cousin", stage=STAGE_RENDER, score=90, outcome="matched")
+    scoring = _seed(session, "dana", stage=STAGE_SCORE)
+    w = _worker(session_factory, FakeSender(), clock, users=(RON, COUSIN, DANA))   # no tailor client
+    w.startup()
+    for ev in (stuck_tailor, stuck_render, scoring):
+        session.refresh(ev)
+    assert stuck_tailor.stage == stuck_render.stage == STAGE_DELIVER
+    assert scoring.stage == STAGE_SCORE                       # other stages are left alone
+    assert stuck_tailor.pdf_path is None and stuck_tailor.page_overflow is False
+    assert "not configured" in stuck_tailor.resume_error
+    assert stuck_tailor.outcome == "matched"                  # still write-once
+
+
+def test_startup_is_a_no_op_when_tailoring_is_configured(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+    _worker_t(session_factory, FakeTailor(), clock, tmp_path).startup()
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
