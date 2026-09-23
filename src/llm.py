@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import requests
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from prompts import SCORE_SYSTEM, reask_message, score_user_message
+from prompts import SCORE_SYSTEM, TAILOR_SYSTEM, reask_message, score_user_message, tailor_user_message
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
@@ -23,10 +23,27 @@ class ScoreResponse(BaseModel):
     posting_usable: bool = True   # false: the text was not a job posting (login wall, error page, ...)
 
 
+class TailorEntry(BaseModel):
+    """Strict: a bullet must be a string ID. An object or a rewritten sentence is a failed reply,
+    not something to coerce — rendering unvalidated prose is exactly what this design forbids."""
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    id: str
+    bullets: list[str] = Field(default_factory=list)
+
+
+class TailorResponse(BaseModel):
+    model_config = ConfigDict(strict=True, extra="ignore")
+
+    experience: list[TailorEntry] = Field(default_factory=list)
+    projects: list[TailorEntry] = Field(default_factory=list)
+    skills: dict[str, list[str]] = Field(default_factory=dict)
+
+
 @dataclass(frozen=True)
 class LLMResult:
     kind: str  # "ok" | "transient" | "unavailable" | "invalid"
-    data: ScoreResponse | None
+    data: ScoreResponse | TailorResponse | None
     error: str | None
     retry_after: float | None
     model: str | None
@@ -97,26 +114,16 @@ class LLMClient:
         return self._model
 
     def score(self, description: str, cv_text: str) -> LLMResult:
-        messages = [
+        return self._ask([
             {"role": "system", "content": SCORE_SYSTEM},
             {"role": "user", "content": score_user_message(description, cv_text)},
-        ]
-        started = time.monotonic()
-        kind, content, error, retry_after, model, usage = self._chat(messages)
-        if kind == "ok":
-            parsed, perr = self._parse(content)
-            if parsed is None:
-                # One re-ask, carrying the bad reply and what was wrong with it.
-                messages += [{"role": "assistant", "content": content}, {"role": "user", "content": reask_message(perr)}]
-                kind, content, error, retry_after, model2, usage2 = self._chat(messages)
-                model, usage = model2 or model, _sum_usage(usage, usage2)
-                if kind == "ok":
-                    parsed, perr = self._parse(content)
-                    if parsed is None:
-                        kind, error = "invalid", f"schema validation failed after re-ask: {perr}"
-            if kind == "ok":
-                return LLMResult("ok", parsed, None, None, model, usage, self._ms(started))
-        return LLMResult(kind, None, error, retry_after, model, usage, self._ms(started))
+        ], ScoreResponse)
+
+    def tailor(self, description: str, cv_id_text: str, max_bullets: int) -> LLMResult:
+        return self._ask([
+            {"role": "system", "content": TAILOR_SYSTEM},
+            {"role": "user", "content": tailor_user_message(description, cv_id_text, max_bullets)},
+        ], TailorResponse)
 
     # -- internals ----------------------------------------------------------
 
@@ -157,8 +164,28 @@ class LLMClient:
         return "ok", content or "", None, None, body.get("model"), body.get("usage")
 
     @staticmethod
-    def _parse(content: str) -> tuple[ScoreResponse | None, str | None]:
+    def _parse(content: str, model_cls) -> tuple[BaseModel | None, str | None]:
         try:
-            return ScoreResponse.model_validate(json.loads(_strip_fence(content))), None
+            return model_cls.model_validate(json.loads(_strip_fence(content))), None
         except (ValueError, ValidationError) as e:  # json.JSONDecodeError is a ValueError
             return None, str(e)[:300]
+
+    def _ask(self, messages: list[dict], model_cls) -> LLMResult:
+        """One call, one re-ask on a schema failure. Shared by score and tailor."""
+        started = time.monotonic()
+        kind, content, error, retry_after, model, usage = self._chat(messages)
+        if kind == "ok":
+            parsed, perr = self._parse(content, model_cls)
+            if parsed is None:
+                # One re-ask, carrying the bad reply and what was wrong with it.
+                messages = messages + [{"role": "assistant", "content": content},
+                                       {"role": "user", "content": reask_message(perr)}]
+                kind, content, error, retry_after, model2, usage2 = self._chat(messages)
+                model, usage = model2 or model, _sum_usage(usage, usage2)
+                if kind == "ok":
+                    parsed, perr = self._parse(content, model_cls)
+                    if parsed is None:
+                        kind, error = "invalid", f"schema validation failed after re-ask: {perr}"
+            if kind == "ok":
+                return LLMResult("ok", parsed, None, None, model, usage, self._ms(started))
+        return LLMResult(kind, None, error, retry_after, model, usage, self._ms(started))
