@@ -2343,11 +2343,18 @@ SELECT tailor_model, COUNT(*) FROM evaluations WHERE tailor_model IS NOT NULL GR
 
 - **Rolling back to a Plan 3 image strands in-flight rows.** A Plan 3 worker has no `tailor` or
   `render` selector at all, so rows sitting at those stages are invisible to it — the drain lives in
-  Plan 4's code and cannot help from an older image. Before rolling back, run:
+  Plan 4's code and cannot help from an older image. **Order matters — stop the worker first**, or
+  an in-flight `run_once()` will lease a row and write its stage back over the reset:
+```bash
+docker compose stop internship-tracker
+```
 ```sql
 UPDATE evaluations SET stage='deliver', attempts=0, pdf_path=NULL, page_overflow=0,
        resume_error='rolled back before the resume was built', next_attempt_at=datetime('now')
 WHERE stage IN ('tailor','render');
+```
+```bash
+docker compose up -d      # now on the Plan 3 image
 ```
 - A line under the existing calibration note: the tailor prompt is separate from `SCORE_SYSTEM`, so calibration-week rubric changes do not touch it.
 - Manual re-render of one row (after fixing a template) — the stored selection is reused, no LLM call:
@@ -2386,6 +2393,16 @@ git commit -m "feat(main): tailor client and output dir; e2e pipeline test; Plan
 - Re-ask second-call-fails and 429-without-`Retry-After` tests → Task 3.
 - cwd-dependent `load_cv("tests/fixtures/...")` paths → Task 8.
 - **`MasterCV` gains no required field in this plan** — in-flight `cv_snapshot`s must keep validating.
+
+## Merge gate
+
+This plan is approved for implementation, not for deployment. Before the branch merges:
+
+- the full suite passes locally (`python3 -m pytest tests/ -q`), and
+- CI's Docker job passes **including Task 4's real-PDF smoke test inside the built image** — a
+  green pytest run proves nothing about pango, cairo or fonts in the container.
+
+Deploying is a separate decision, taken after the merge with the Task 8 runbook.
 
 ## Review round — changes made after the first draft
 
