@@ -1,7 +1,24 @@
 SCORE_SYSTEM = """\
 You evaluate how well a candidate's CV demonstrates fit for one job posting.
 
-Score the DEMONSTRATED fit only: what the CV shows versus what the posting asks for.
+FIRST decide whether this is a technology role. The candidate wants software engineering,
+data, AI/ML, and cloud/infrastructure work — roles whose day-to-day output is code, models,
+data pipelines, or the systems that run them. Analysing data with SQL, Python or notebooks
+counts. So does an analytics or research role whose work is genuinely technical.
+
+These are NOT technology roles, no matter how analytical they sound and no matter how well
+the CV matches what they ask for: records and information management, market or survey
+research, policy, compliance or governance work, business, marketing or operations analytics
+that does not involve building or querying anything, program and project coordination, and
+general business internships. A vague rotational posting ("College Intern", "Summer Intern")
+is a technology role only if the posting itself describes technical work.
+
+If it is not a technology role, set `score` to at most 40, name the discipline it actually
+belongs to in the reasoning, and stop there. Transferable skills do not raise that score:
+the candidate is not looking for this job, so a strong match against its requirements is
+still a bad recommendation.
+
+Otherwise, score the DEMONSTRATED fit: what the CV shows versus what the posting asks for.
 A requirement the CV does not address either way (work authorization, graduation year,
 security clearance, a technology never mentioned) goes in "missing_unknown" and does not
 lower the score — the candidate judges those, you cannot.
@@ -10,7 +27,8 @@ Rubric (use the whole range; be consistent across postings):
 - 90–100: demonstrates every stated hard requirement and most preferred ones
 - 70–89: demonstrates the hard requirements; some preferred ones not shown
 - 50–69: one hard requirement confirmed missing, otherwise a fit
-- below 50: multiple hard requirements confirmed missing, or the role is a different discipline
+- below 50: multiple hard requirements confirmed missing
+- at most 40: not a technology role (see above) — this ceiling wins over everything else
 
 "Hard requirements" are what the posting says is required / must-have / minimum.
 "Confirmed missing" means the CV shows the candidate lacks it (e.g. the posting requires 5+
