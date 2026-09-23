@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cv import MasterCV, all_ids, cv_to_text, load_cv
+from cv import MAX_EXPERIENCE_ENTRIES, MAX_PROJECT_ENTRIES, MasterCV, all_ids, cv_to_id_text, cv_to_text, load_cv, validate_selection
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")
 
@@ -83,3 +83,155 @@ def test_cv_to_text_includes_summary_when_present():
 def test_master_cv_roundtrips_through_dict():
     cv = load_cv(FIXTURE)
     assert MasterCV.model_validate(cv.model_dump()) == cv
+
+
+# A CV with room to choose from: the 1-experience/1-project `cv_sample.yaml` cannot distinguish
+# "the validator filtered correctly" from "the too-few-entries fallback replaced the selection".
+# A NEW NAME: `FIXTURE` already exists at tests/test_cv.py:8 and nine tests read it, including
+# test_all_ids_covers_entries_and_bullets, which asserts cv_sample.yaml's exact id set. Rebinding
+# it would break them. Leave line 8 alone.
+TAILOR_FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")
+
+
+def _cv():
+    return load_cv(TAILOR_FIXTURE)
+
+
+def test_id_text_labels_every_entry_and_bullet():
+    text = cv_to_id_text(_cv())
+    cv = _cv()
+    for entry in [*cv.experience, *cv.projects]:
+        assert f"[{entry.id}]" in text
+        for b in entry.bullets:
+            assert f"[{b.id}]" in text
+    # Education and the summary are rendered from the master; the model must not select them.
+    assert "[edu" not in text
+
+
+def test_unknown_entry_is_dropped_with_a_warning():
+    # Two valid entries, so what survives is the filtering and not the fallback.
+    cv = _cv()
+    a, b = cv.experience[0], cv.experience[1]
+    sel, warnings = validate_selection(cv, {
+        "experience": [{"id": "nope", "bullets": []},
+                       {"id": a.id, "bullets": [a.bullets[0].id]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
+        "projects": [], "skills": {},
+    })
+    assert [e["id"] for e in sel["experience"]] == [a.id, b.id]
+    assert any("nope" in w for w in warnings)
+
+
+def test_bullet_under_the_wrong_entry_is_dropped():
+    # Two entries, so the too-few-entries fallback stays out of the way and the filtering is visible.
+    cv = _cv()
+    a, b = cv.experience[0], cv.experience[1]
+    sel, warnings = validate_selection(cv, {
+        "experience": [{"id": a.id, "bullets": [b.bullets[0].id, a.bullets[0].id]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
+        "projects": [], "skills": {},
+    })
+    assert sel["experience"][0]["bullets"] == [a.bullets[0].id]
+    assert any(b.bullets[0].id in w for w in warnings)
+
+
+def test_model_order_is_preserved():
+    cv = _cv()
+    a, b = cv.experience[0], cv.experience[1]
+    ids = [x.id for x in a.bullets][:2]
+    sel, _ = validate_selection(cv, {
+        "experience": [{"id": b.id, "bullets": [b.bullets[0].id]},
+                       {"id": a.id, "bullets": list(reversed(ids))}],
+        "projects": [], "skills": {}})
+    assert [e["id"] for e in sel["experience"]] == [b.id, a.id]
+    assert sel["experience"][1]["bullets"] == list(reversed(ids))
+
+
+def test_bullet_cap_keeps_the_first_n_in_the_given_order():
+    cv = _cv()
+    fat = max(cv.projects, key=lambda p: len(p.bullets))
+    other = next(p for p in cv.projects if p.id != fat.id)
+    ids = [b.id for b in fat.bullets]
+    sel, _ = validate_selection(cv, {
+        "experience": [],
+        "projects": [{"id": fat.id, "bullets": ids}, {"id": other.id, "bullets": [other.bullets[0].id]}],
+        "skills": {}}, max_bullets=2)
+    assert sel["projects"][0]["bullets"] == ids[:2]
+
+
+def test_entry_caps_applied():
+    cv = _cv()
+    sel, _ = validate_selection(cv, {
+        "experience": [{"id": e.id, "bullets": [e.bullets[0].id]} for e in cv.experience],
+        "projects": [{"id": p.id, "bullets": [p.bullets[0].id]} for p in cv.projects],
+        "skills": {},
+    })
+    assert len(sel["experience"]) <= MAX_EXPERIENCE_ENTRIES
+    assert len(sel["projects"]) <= MAX_PROJECT_ENTRIES
+
+
+def test_foreign_skill_dropped_and_group_subset_enforced():
+    cv = _cv()
+    group = next(iter(cv.skills))
+    real = cv.skills[group][0]
+    sel, warnings = validate_selection(cv, {
+        "experience": [], "projects": [],
+        "skills": {group: [real, "COBOL-on-Mars"], "invented_group": ["x"]},
+    })
+    assert sel["skills"] == {group: [real]}
+    assert any("COBOL-on-Mars" in w for w in warnings)
+    assert any("invented_group" in w for w in warnings)
+
+
+def test_too_few_experience_entries_falls_back_to_master_order():
+    cv = _cv()
+    sel, warnings = validate_selection(cv, {"experience": [], "projects": [], "skills": {}}, max_bullets=2)
+    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MAX_EXPERIENCE_ENTRIES]
+    assert sel["experience"][0]["bullets"] == [b.id for b in cv.experience[0].bullets][:2]
+    assert any("experience" in w for w in warnings)
+
+
+def test_projects_fall_back_independently_of_experience():
+    cv = _cv()
+    keep = [{"id": e.id, "bullets": [e.bullets[0].id]} for e in cv.experience[:2]]
+    sel, _ = validate_selection(cv, {"experience": keep, "projects": [], "skills": {}})
+    assert [e["id"] for e in sel["experience"]] == [e["id"] for e in keep]   # untouched
+    assert len(sel["projects"]) >= min(2, len(cv.projects))                   # fell back on its own
+
+
+def test_duplicate_ids_are_collapsed():
+    cv = _cv()
+    a, b = cv.experience[0], cv.experience[1]
+    bid = a.bullets[0].id
+    sel, warnings = validate_selection(cv, {
+        "experience": [{"id": a.id, "bullets": [bid, bid]}, {"id": a.id, "bullets": [bid]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
+        "projects": [], "skills": {}})
+    assert [e["id"] for e in sel["experience"]] == [a.id, b.id]
+    assert sel["experience"][0]["bullets"] == [bid]
+    assert any("duplicate" in w for w in warnings)
+
+
+def test_a_single_surviving_entry_triggers_the_fallback():
+    # The other side of the coin the tests above avoid: one entry is not a resume section.
+    cv = _cv()
+    a = cv.experience[0]
+    sel, warnings = validate_selection(cv, {"experience": [{"id": a.id, "bullets": [a.bullets[0].id]}],
+                                            "projects": [], "skills": {}}, max_bullets=2)
+    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MAX_EXPERIENCE_ENTRIES]
+    assert any("fell back" in w for w in warnings)
+
+
+def test_selection_is_json_round_trippable():
+    import json
+    cv = _cv()
+    sel, _ = validate_selection(cv, {"experience": [], "projects": [], "skills": {}})
+    assert json.loads(json.dumps(sel)) == sel
+
+
+def test_extra_key_in_cv_yaml_is_rejected():
+    # Guards `extra="forbid"` on the CV schema — carried over from Plan 3's review.
+    raw = yaml.safe_load(Path(TAILOR_FIXTURE).read_text())
+    raw["favourite_colour"] = "blue"
+    with pytest.raises(Exception):
+        MasterCV.model_validate(raw)
