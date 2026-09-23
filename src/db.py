@@ -24,6 +24,8 @@ from config import FeedSpec
 from state import read_known_urls, read_last_sha
 
 STAGE_SCORE = "score"
+STAGE_TAILOR = "tailor"
+STAGE_RENDER = "render"
 STAGE_DELIVER = "deliver"
 STAGE_CLOSED = "closed"
 
@@ -90,7 +92,7 @@ class Evaluation(Base):
     job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"))
     user_id: Mapped[str] = mapped_column(String)
 
-    # Next action to run: score → deliver → closed (tailor/render arrive in Plan 4).
+    # Next action to run: score → tailor → render → deliver → closed.
     stage: Mapped[str] = mapped_column(String, default=STAGE_SCORE)
     # Written once at a fallback decision; never overwritten.
     outcome: Mapped[str | None] = mapped_column(String, nullable=True)
@@ -104,6 +106,8 @@ class Evaluation(Base):
     score_usage: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     tailored: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     pdf_path: Mapped[str | None] = mapped_column(String, nullable=True)
+    # Why a match went out without a PDF. Diagnostic; `outcome` stays "matched".
+    resume_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_overflow: Mapped[bool] = mapped_column(Boolean, default=False)
 
     attempts: Mapped[int] = mapped_column(Integer, default=0)

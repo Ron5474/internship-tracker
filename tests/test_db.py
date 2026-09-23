@@ -211,3 +211,14 @@ def test_evaluation_defaults_to_score_stage_with_score_columns(session):
     assert ev.stage == STAGE_SCORE
     assert ev.score_model is None
     assert ev.score_usage is None
+
+
+def test_ensure_columns_adds_resume_error(tmp_path):
+    # A database written before Plan 4 gains the column without a migration.
+    path = str(tmp_path / "old.db")
+    engine = make_engine(path)
+    init_db(engine)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE evaluations DROP COLUMN resume_error"))
+    assert "evaluations.resume_error" in ensure_columns(engine)
+    assert "resume_error" in {c["name"] for c in inspect(engine).get_columns("evaluations")}

@@ -67,7 +67,7 @@ def test_poll_loop_survives_exception_and_continues(monkeypatch):
 # --- end to end: build → poll → poll → deliver --------------------------------
 
 def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_tailor_model="pro", max_bullets_per_entry=4, llm_timeout=5)
     users = [RON]
     session_factory, worker = main.build(settings, users, llm=FakeLLM())
 
@@ -111,7 +111,7 @@ def test_poll_all_then_run_once_delivers_new_posting(tmp_path):
 
 def test_poll_fetch_score_deliver_end_to_end(tmp_path):
     from fetcher import FetchResult
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_tailor_model="pro", max_bullets_per_entry=4, llm_timeout=5)
     users = [User(id="ron", cv="tests/fixtures/cv_sample.yaml", discord_webhook="https://d/ron", feeds=["internships"],
                   sections=["software engineering"])]
     session_factory, worker = main.build(settings, users, llm=FakeLLM())
@@ -147,7 +147,7 @@ def test_poll_fetch_score_deliver_end_to_end(tmp_path):
 
 
 def test_build_fails_fast_on_missing_cv(tmp_path):
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_tailor_model="pro", max_bullets_per_entry=4, llm_timeout=5)
     users = [User(id="ron", cv=str(tmp_path / "missing.yaml"), discord_webhook="https://d/ron",
                   feeds=["internships"], sections=["software engineering"])]
     with pytest.raises(ValueError, match="missing.yaml"):
@@ -162,6 +162,7 @@ def test_main_loads_cvs_before_migration(monkeypatch, tmp_path):
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("LLM_BASE_URL", "http://llm")
     monkeypatch.setenv("LLM_SCORE_MODEL", "m")
+    monkeypatch.setenv("LLM_TAILOR_MODEL", "pro")
     migrate = Mock(return_value=True)
     monkeypatch.setattr(main, "migrate_state", migrate)
     with pytest.raises(ValueError, match="missing"):
@@ -171,7 +172,7 @@ def test_main_loads_cvs_before_migration(monkeypatch, tmp_path):
 
 def test_below_threshold_end_to_end_closes_without_post(tmp_path):
     from fetcher import FetchResult
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token="tok", llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_tailor_model="pro", max_bullets_per_entry=4, llm_timeout=5)
     users = [User(id="ron", cv="tests/fixtures/cv_sample.yaml", discord_webhook="https://d/ron", feeds=["internships"],
                   sections=["software engineering"])]
     session_factory, worker = main.build(settings, users, llm=FakeLLM(score=30))
@@ -203,7 +204,7 @@ def test_below_threshold_end_to_end_closes_without_post(tmp_path):
 def test_build_imports_legacy_state(tmp_path):
     state.write_known_urls(str(tmp_path), {"https://a.com/1", "https://b.com/2"})
     state.write_last_sha(str(tmp_path), "abc1234")
-    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token=None, llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_timeout=5)
+    settings = Settings(data_dir=str(tmp_path), poll_interval=1, github_token=None, llm_base_url="http://llm", llm_api_key=None, llm_score_model="m", llm_tailor_model="pro", max_bullets_per_entry=4, llm_timeout=5)
 
     session_factory, _worker = main.build(settings, [RON])
 

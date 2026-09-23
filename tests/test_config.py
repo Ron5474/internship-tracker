@@ -2,7 +2,7 @@ import pytest
 
 from config import FEEDS, FeedSpec, load_settings
 
-LLM = {"LLM_BASE_URL": "http://litellm:4000/v1", "LLM_SCORE_MODEL": "deepseek-v4-flash"}
+LLM = {"LLM_BASE_URL": "http://litellm:4000/v1", "LLM_SCORE_MODEL": "deepseek-v4-flash", "LLM_TAILOR_MODEL": "pro"}
 
 
 def test_feeds_registry_has_both_feeds():
@@ -49,3 +49,30 @@ def test_load_settings_treats_blank_token_as_none():
 def test_load_settings_rejects_non_integer_interval():
     with pytest.raises(ValueError):
         load_settings({**LLM, "POLL_INTERVAL_SECONDS": "soon"})
+
+
+def test_tailor_model_required():
+    env = {"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "flash"}
+    with pytest.raises(ValueError, match="LLM_TAILOR_MODEL"):
+        load_settings(env)
+
+
+def test_tailor_model_and_bullet_cap_parsed():
+    s = load_settings({
+        "LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "flash",
+        "LLM_TAILOR_MODEL": "pro", "MAX_BULLETS_PER_ENTRY": "3",
+    })
+    assert s.llm_tailor_model == "pro"
+    assert s.max_bullets_per_entry == 3
+
+
+@pytest.mark.parametrize("bad", ["0", "-2"])
+def test_bullet_cap_must_be_positive(bad):
+    with pytest.raises(ValueError, match="MAX_BULLETS_PER_ENTRY"):
+        load_settings({"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "f",
+                       "LLM_TAILOR_MODEL": "p", "MAX_BULLETS_PER_ENTRY": bad})
+
+
+def test_bullet_cap_defaults_to_four():
+    s = load_settings({"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "f", "LLM_TAILOR_MODEL": "p"})
+    assert s.max_bullets_per_entry == 4
