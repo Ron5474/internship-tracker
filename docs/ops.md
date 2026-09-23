@@ -129,6 +129,29 @@ UPDATE evaluations SET stage='score', outcome=NULL, attempts=0,
 
 `cv_snapshot=NULL` is what makes the re-score read the edited CV; leaving it set re-scores against the old one — harmless after a prompt change (same CV, new rubric), wrong after a CV edit.
 
+#### Round 1 finding: the rubric had no discipline gate (2026-09-23)
+
+The first real batch scored 15 matches, of which 7 were not technology roles — including
+`Excellus BCBS — College Intern, Records and Information Management` at **82** and
+`Federal Reserve — Research Business Survey Intern` at **62**. Nothing was broken: the rubric
+asked "does the CV demonstrate what this posting asks for", and for a generalist internship
+wanting analytical skills and communication, this CV genuinely does. The only discipline check
+sat in the bottom band ("below 50: … or the role is a different discipline") and the model never
+reached for it, because on the stated requirements these *were* matches.
+
+The one correct rejection that batch — `DFW Airport — Environmental Technical Projects` at 58 —
+worked because that posting listed technical requirements the CV misses, not because the model
+noticed the discipline was wrong.
+
+Fix: `SCORE_SYSTEM` now decides "is this a technology role?" **before** scoring fit, and caps
+anything that is not at 40 regardless of how well the CV matches. Software, data, AI/ML and
+cloud count, including genuinely technical analytics; records management, survey and market
+research, policy and governance, non-technical business analytics, and program coordination
+do not. Guarded by `tests/test_prompts.py`.
+
+Watch the next batch for the opposite error — a real data or ML posting pushed under 40 by the
+gate. If that happens the category list is too broad, not the ceiling.
+
 ## Deploying Plan 4
 
 1. **Server prep.** Add `LLM_TAILOR_MODEL=deepseek-v4-pro` and `MAX_BULLETS_PER_ENTRY=4` to `~/deployed-projects/internship-tracker/.env`; the container creates `data/output/<user>/` itself. Nothing prunes `data/output/`: rendered PDFs accumulate there indefinitely, including orphans left behind once `pdf_path` is cleared (a re-tailor, a below-threshold re-score, a manual re-render). Confirm the alias exists:
