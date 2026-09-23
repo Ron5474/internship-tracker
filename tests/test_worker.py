@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -574,6 +575,8 @@ LLM_UNUSABLE = LLMResult("ok", ScoreResponse(score=0, reasoning="Login wall.", m
 
 
 class FakeLLM:
+    model = "flash"
+
     def __init__(self, *results):
         self.results = list(results)
         self.calls = []
@@ -614,7 +617,7 @@ def test_score_match_stores_fields_and_moves_to_deliver(session_factory, session
     assert ev.score == 82 and ev.reasoning == "Because."
     assert ev.missing_confirmed == ["K8s"] and ev.missing_unknown == ["visa"]
     assert ev.score_model == "deepseek-v4-flash" and ev.score_usage["prompt_tokens"] == 10
-    assert ev.attempts == 1 and ev.last_error is None
+    assert ev.attempts == 0 and ev.last_error is None   # the budget belongs to the stage, not the row
 
 
 def test_score_below_threshold_closes_silently(session_factory, session, clock):
@@ -744,7 +747,7 @@ def test_invalid_streak_pauses_llm(session_factory, session, clock):
     w.run_once(); w.run_once()
     assert "llm" not in w.paused
     w.run_once()
-    assert w.paused["llm"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+    assert w.paused["llm:flash"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
 
 
 def test_invalid_streak_resets_on_ok(session_factory, session, clock):
@@ -792,8 +795,8 @@ def test_score_unavailable_resume_is_measured_from_after_the_call(session_factor
     w = _worker_s(session_factory, SlowLLM(clock, 120, LLM_DOWN), clock)
     w.run_once()
     session.refresh(ev)
-    assert w.paused["llm"] == T0 + timedelta(seconds=120 + LLM_PAUSE_SECONDS)
-    assert ev.next_attempt_at == w.paused["llm"]
+    assert w.paused["llm:flash"] == T0 + timedelta(seconds=120 + LLM_PAUSE_SECONDS)
+    assert ev.next_attempt_at == w.paused["llm:flash"]
 
 
 def test_score_over_budget_on_restart_goes_straight_to_fallback(session_factory, session, clock):
@@ -840,7 +843,7 @@ def test_score_unavailable_pauses_llm_without_consuming_attempt(session_factory,
     assert w.run_once() is True         # ron: unavailable
     session.refresh(ev_ron)
     assert ev_ron.attempts == 0 and ev_ron.stage == STAGE_SCORE
-    assert w.paused["llm"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+    assert w.paused["llm:flash"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
     assert ev_ron.next_attempt_at == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
     assert w.run_once() is False        # cousin waits too; nothing deliverable
     assert len(llm.calls) == 1
@@ -914,3 +917,198 @@ def test_score_without_llm_configured_is_skipped(session_factory, session, clock
     _seed_scoreable(session)
     w = Worker(session_factory, [RON, COUSIN], cvs=CVS, llm=None, send=FakeSender(), fetch=FakeFetcher(), now=clock)
     assert w.run_once() is False
+
+
+def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, session, clock, tmp_path):
+    _seed_scoreable(session, "ron")
+    _seed_tailorable(session, "cousin")
+    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), FakeTailor(), clock, tmp_path)
+    w.run_once()
+    assert w.is_paused("llm:flash") is True and w.is_paused("llm:pro") is False
+    assert w.run_once() is True          # the tailor row still moves
+
+
+# --- tailor ------------------------------------------------------------------
+
+from pathlib import Path
+
+from db import STAGE_RENDER, STAGE_TAILOR
+from worker import TAILOR_BUDGET
+
+# Two entries per section, so the too-few-entries fallback does not quietly replace what the
+# fake returned. CV_SNAPSHOT is load_cv(tests/fixtures/cv_tailor.yaml).model_dump() (Task 2).
+CV_SNAPSHOT = load_cv(str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")).model_dump()
+
+SELECTION = {
+    "experience": [{"id": "exp1", "bullets": ["exp1.b1"]}, {"id": "exp2", "bullets": ["exp2.b1"]}],
+    "projects": [{"id": "proj1", "bullets": ["proj1.b1"]}, {"id": "proj2", "bullets": ["proj2.b1"]}],
+    "skills": {},
+}
+
+
+class FakeTailor:
+    """Stands in for an LLMClient built with LLM_TAILOR_MODEL."""
+    model = "pro"
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = []
+
+    def tailor(self, description, cv_id_text, max_bullets):
+        self.calls.append((description, cv_id_text, max_bullets))
+        return self.results.pop(0) if self.results else _tailor_ok()
+
+
+def _tailor_ok(data=None):
+    from llm import TailorResponse
+    return LLMResult("ok", TailorResponse.model_validate(data or SELECTION), None, None, "pro", {}, 5)
+
+
+def _seed_tailorable(session, user_id="ron", **kw):
+    ev = _seed(session, user_id, stage=STAGE_TAILOR, score=82, outcome="matched",
+               cv_snapshot=CV_SNAPSHOT, **kw)
+    ev.job.description = "JOB DESCRIPTION TEXT"
+    session.commit()
+    return _resolve(session, ev)
+
+
+def _worker_t(session_factory, tailor, clock, output_dir, cvs=None, users=(RON, COUSIN), send=None):
+    return Worker(session_factory, list(users),
+                  cvs=cvs if cvs is not None else {"ron": CV_SNAPSHOT, "cousin": CV_SNAPSHOT},
+                  tailor=tailor, output_dir=str(output_dir), send=send or FakeSender(),
+                  fetch=FakeFetcher(), now=clock)
+
+
+def _worker_st(session_factory, llm, tailor, clock, output_dir, cvs=None, users=(RON, COUSIN), send=None):
+    return Worker(session_factory, list(users), cvs=cvs if cvs is not None else CVS,
+                  llm=llm, tailor=tailor, output_dir=str(output_dir), send=send or FakeSender(),
+                  fetch=FakeFetcher(), now=clock)
+
+
+def test_tailor_stores_the_validated_selection_and_moves_to_render(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+    w = _worker_t(session_factory, FakeTailor(), clock, tmp_path)
+    assert w.run_once() is True
+    session.refresh(ev)
+    assert ev.stage == STAGE_RENDER
+    assert ev.tailored["experience"][0]["bullets"] == ["exp1.b1"]
+    assert ev.attempts == 0            # the counter resets for the next stage
+    assert ev.outcome == "matched"     # never overwritten
+
+
+def test_tailor_is_sent_the_snapshot_not_the_live_cv(session_factory, session, clock, tmp_path):
+    # The CV on disk is edited mid-evaluation; the prompt must still describe what was scored.
+    snapshot = json.loads(json.dumps(CV_SNAPSHOT))
+    snapshot["experience"][0]["bullets"][0]["text"] = "SNAPSHOT BULLET"
+    live = json.loads(json.dumps(CV_SNAPSHOT))
+    live["experience"][0]["bullets"][0]["text"] = "LIVE BULLET"
+    ev = _seed_tailorable(session)
+    ev.cv_snapshot = snapshot
+    session.commit()
+    tailor = FakeTailor()
+    _worker_t(session_factory, tailor, clock, tmp_path, cvs={"ron": live}).run_once()
+    description, cv_id_text, max_bullets = tailor.calls[0]
+    assert "SNAPSHOT BULLET" in cv_id_text and "LIVE BULLET" not in cv_id_text
+    assert description == "JOB DESCRIPTION TEXT"
+    assert max_bullets == 4
+
+
+def test_invalid_ids_are_dropped_before_storage(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+    junk = {"experience": [{"id": "does-not-exist", "bullets": ["nope"]}], "projects": [], "skills": {}}
+    _worker_t(session_factory, FakeTailor(_tailor_ok(junk)), clock, tmp_path).run_once()
+    session.refresh(ev)
+    ids = [e["id"] for e in ev.tailored["experience"]]
+    assert "does-not-exist" not in ids and ids                # fell back to the master's order
+
+
+def test_giving_up_clears_a_previous_runs_pdf(session_factory, session, clock, tmp_path):
+    # Re-scoring an already-delivered row leaves the old PDF on the evaluation.
+    ev = _seed_tailorable(session, attempts=TAILOR_BUDGET - 1,
+                          pdf_path="/data/output/ron/1-stripe.pdf", page_overflow=True)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("invalid", None, "bad", None, "pro", None, 1)),
+                  clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.pdf_path is None and ev.page_overflow is False
+
+
+def test_tailor_budget_exhausted_delivers_the_score_without_a_pdf(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session, attempts=TAILOR_BUDGET - 1)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("invalid", None, "bad json", None, "pro", None, 3)),
+                  clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER and ev.outcome == "matched"
+    assert ev.pdf_path is None and "bad json" in ev.resume_error
+    assert ev.attempts == 0
+
+
+def test_tailor_transient_pauses_the_endpoint_for_both_stages(session_factory, session, clock, tmp_path):
+    _seed_tailorable(session)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("transient", None, "429", 60.0, "pro", None, 2)),
+                  clock, tmp_path)
+    w.run_once()
+    assert w.is_paused("llm") is True
+
+
+def test_tailor_unavailable_pauses_only_its_own_model(session_factory, session, clock, tmp_path):
+    _seed_tailorable(session)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("unavailable", None, "HTTP 404: no such model",
+                                                        None, None, None, 2)), clock, tmp_path)
+    w.run_once()
+    assert w.is_paused("llm:pro") is True
+    assert w.is_paused("llm") is False          # scoring keeps running on the flash model
+
+
+def test_unavailable_tailor_gives_the_lease_back(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("unavailable", None, "401", None, None, None, 1)),
+                  clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.attempts == 0 and ev.stage == STAGE_TAILOR
+
+
+def test_over_budget_on_restart_makes_no_call(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session, attempts=TAILOR_BUDGET)
+    tailor = FakeTailor()
+    _worker_t(session_factory, tailor, clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert tailor.calls == [] and ev.stage == STAGE_DELIVER and "budget" in ev.resume_error
+
+
+def test_attempt_is_leased_before_the_call(session_factory, session, clock, tmp_path):
+    ev = _seed_tailorable(session)
+
+    def boom(description, cv_id_text, max_bullets):
+        raise RuntimeError("killed mid-call")
+
+    tailor = FakeTailor()
+    tailor.tailor = boom
+    _worker_t(session_factory, tailor, clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.attempts == 1          # the attempt was committed before the crash-prone call
+
+
+def test_matched_goes_to_tailor_when_tailoring_is_configured(session_factory, session, clock, tmp_path):
+    ev = _seed_scoreable(session, "ron")          # existing Plan 3 helper
+    w = _worker_st(session_factory, FakeLLM(_llm_ok()), FakeTailor(), clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
+
+
+def test_matched_goes_straight_to_deliver_when_tailoring_is_not_configured(session_factory, session, clock):
+    ev = _seed_scoreable(session, "ron")
+    _worker_s(session_factory, FakeLLM(_llm_ok()), clock, FakeSender()).run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER              # Plan 3 behaviour is unchanged
+
+
+def test_tailor_skipped_while_the_users_webhook_is_paused(session_factory, session, clock, tmp_path):
+    _seed_tailorable(session)
+    tailor = FakeTailor()
+    w = _worker_t(session_factory, tailor, clock, tmp_path)
+    w._pause("discord:ron", None, "gone")
+    assert w.run_once() is False and tailor.calls == []    # no tokens spent on an undeliverable row
