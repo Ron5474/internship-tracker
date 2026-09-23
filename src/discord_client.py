@@ -7,10 +7,13 @@ import requests
 MAX_CONTENT = 2000
 _ELLIPSIS = "…"
 
+OVERFLOW_NOTE = "📄 Resume ran over one page — trim before sending"
+NO_RESUME_NOTE = "⚠️ Couldn't generate resume — apply with your master CV."
+
 
 @dataclass(frozen=True)
 class DeliveryResult:
-    kind: str  # "ok" | "transient" | "gone" | "invalid"
+    kind: str  # "ok" | "transient" | "gone" | "invalid" | "attachment"
     retry_after: float | None
     error: str | None
 
@@ -29,49 +32,74 @@ def format_link_only(company: str, role: str, location: str, url: str, note: str
 def format_match(
     company: str, role: str, location: str, url: str,
     score: int, reasoning: str, missing_confirmed: list[str], missing_unknown: list[str],
-    matched: bool,
+    matched: bool, overflow: bool = False, resume_missing: bool = False,
 ) -> str:
     icon = "🎯" if matched else "📉"
     header = f"{icon} {score}% — **{company}** — {role}\n📍 {location}\n🔗 {url}"
-    if reasoning:
-        header += f"\n✅ Why: {reasoning}"
+    body = f"✅ Why: {reasoning}" if reasoning else ""
     lists = []
     if missing_confirmed:
         lists.append("⚠️ Gaps: " + ", ".join(missing_confirmed))
     if missing_unknown:
         lists.append("❓ Not on CV: " + ", ".join(missing_unknown))
-    return cap_content(header, lists)
+
+    notes = []
+    if resume_missing:
+        notes.append(NO_RESUME_NOTE)
+    if overflow:
+        notes.append(OVERFLOW_NOTE)
+    return cap_content(header, lists, tail="\n".join(notes), body=body)
 
 
-def cap_content(header: str, lists: list[str], tail: str = "") -> str:
-    """Join header + list lines + tail under MAX_CONTENT.
+def cap_content(header: str, lists: list[str], tail: str = "", body: str = "") -> str:
+    """Join header + body + list lines + tail under MAX_CONTENT.
 
-    List lines (gaps, unknowns) are truncated first, then the tail (reasoning),
-    so an oversized list never produces a request Discord will reject forever.
+    Priority when it does not fit: the header and the tail always survive. The tail carries the
+    resume notices, and the difference between "apply with this PDF" and "apply with your master
+    CV" must not be what gets dropped. List lines go first, then the body (the reasoning).
     """
-    parts = [header, *lists] + ([tail] if tail else [])
-    budget = MAX_CONTENT - (len(parts) - 1)  # newlines
-    fixed = len(header)
-    remaining = budget - fixed - (len(tail) if tail else 0)
-    capped_lists = []
+    if len(tail) > MAX_CONTENT:
+        # The notices are short fixed strings, so this never fires today. It is here because the
+        # cap is absolute: this helper must not return more than MAX_CONTENT characters for ANY
+        # input, and the branch below would otherwise hand an oversized tail straight back.
+        tail = tail[: MAX_CONTENT - 1] + _ELLIPSIS
+
+    tail_cost = len(tail) + 1 if tail else 0
+    if len(header) + tail_cost > MAX_CONTENT:
+        # Pathological: even the header does not fit. It gives way, never the tail.
+        keep = MAX_CONTENT - tail_cost - 1
+        head = header[:keep] + _ELLIPSIS if keep > 0 else ""
+        return "\n".join(p for p in (head, tail) if p)
+
+    remaining = MAX_CONTENT - len(header) - tail_cost
+    kept_body = ""
+    if body and remaining > 2:
+        kept_body = body if len(body) + 1 <= remaining else body[: remaining - 2] + _ELLIPSIS
+        remaining -= len(kept_body) + 1
+
+    kept_lists = []
     for line in lists:
-        if remaining <= 0:
+        if remaining <= 2:
             break
-        if len(line) > remaining:
-            line = line[: max(remaining - 1, 0)] + _ELLIPSIS
-        capped_lists.append(line)
-        remaining -= len(line)
-    out = "\n".join([header, *capped_lists] + ([tail] if tail else []))
-    if len(out) > MAX_CONTENT:
-        out = out[: MAX_CONTENT - 1] + _ELLIPSIS
-    return out
+        if len(line) + 1 > remaining:
+            line = line[: remaining - 2] + _ELLIPSIS
+        kept_lists.append(line)
+        remaining -= len(line) + 1
+
+    return "\n".join(p for p in (header, kept_body, *kept_lists, tail) if p)
 
 
 def send_message(webhook_url: str, content: str, pdf_path: str | None = None) -> DeliveryResult:
     """POST to a Discord webhook with ?wait=true. Success is 200 with a message body only."""
     try:
         if pdf_path:
-            with open(pdf_path, "rb") as fh:
+            try:
+                fh = open(pdf_path, "rb")
+            except OSError as e:
+                # A distinct kind, not "invalid": the message is fine, only the file is not, and
+                # `invalid` is retried forever. The worker drops the attachment and sends the rest.
+                return DeliveryResult("attachment", None, f"cannot read {pdf_path}: {e}")
+            with fh:
                 resp = requests.post(
                     webhook_url,
                     params={"wait": "true"},
