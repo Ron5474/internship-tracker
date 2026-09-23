@@ -32,7 +32,7 @@ These resolve gaps or conflicts in the spec. They are decisions, not suggestions
 2. **`evaluations.attempts` means "attempts at the current stage" and resets to 0 on every stage transition.** One counter, three budgets (`SCORE_BUDGET=3`, `TAILOR_BUDGET=3`, `RENDER_BUDGET=2`). No new columns.
 3. **Pause keys split by cause.** A `transient` LLM failure (429/5xx/timeout) says the *endpoint* is unwell and pauses `llm`, holding both stages. An `unavailable` failure (401/403/404) is a config/model problem and pauses `llm:<model>` only, so a wrong `LLM_TAILOR_MODEL` alias cannot stop scoring. Both stages check `llm` and their own `llm:<model>`.
 4. **`run_once()` order is `deliver → fetch → render → score → tailor`** — ready messages first, then cheap network, then local CPU, then the cheap LLM call, then the expensive one.
-5. **Tailoring is optional at runtime.** With no tailor client or no output directory, `score` sends a match straight to `deliver` exactly as it does today. Rows are never parked at a stage nothing can run.
+5. **Tailoring is optional at runtime, and queued rows drain when it is off.** `LLM_TAILOR_MODEL` stays **required** — no new disable flag. But `Worker` can still be built without a tailor client or an output directory (every Plan 1–3 test does exactly that), so two things must hold: `score` sends a match straight to `deliver`, *and* rows an earlier process left at `tailor` or `render` are moved to `deliver` at startup with `resume_error` set. Without the second, "never parked at a stage nothing can run" is a claim this plan would break rather than keep.
 6. **The too-few-entries fallback is per section.** If validation leaves fewer than two experience entries and the snapshot has more to offer, experience falls back to the snapshot's own order (capped); projects are decided independently.
 
 ## File Structure
@@ -95,6 +95,13 @@ def test_tailor_model_and_bullet_cap_parsed():
     assert s.max_bullets_per_entry == 3
 
 
+@pytest.mark.parametrize("bad", ["0", "-2"])
+def test_bullet_cap_must_be_positive(bad):
+    with pytest.raises(ValueError, match="MAX_BULLETS_PER_ENTRY"):
+        load_settings({"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "f",
+                       "LLM_TAILOR_MODEL": "p", "MAX_BULLETS_PER_ENTRY": bad})
+
+
 def test_bullet_cap_defaults_to_four():
     s = load_settings({"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "f", "LLM_TAILOR_MODEL": "p"})
     assert s.max_bullets_per_entry == 4
@@ -132,7 +139,19 @@ In `src/config.py`, add to `Settings` (after `llm_score_model`) and to `load_set
 
 ```python
         llm_tailor_model=_required(env, "LLM_TAILOR_MODEL"),
-        max_bullets_per_entry=int(env.get("MAX_BULLETS_PER_ENTRY", "4")),
+        max_bullets_per_entry=_positive_int(env, "MAX_BULLETS_PER_ENTRY", 4),
+```
+
+with the helper beside `_required`:
+
+```python
+def _positive_int(env: Mapping[str, str], name: str, default: int) -> int:
+    """A cap of zero is not "no cap": it would disable validate_selection's stopping condition
+    while still emptying the fallback slice. Refuse it at startup, not at the first tailor call."""
+    value = int(env.get(name, str(default)))
+    if value < 1:
+        raise ValueError(f"{name} must be at least 1 (got {value})")
+    return value
 ```
 
 Keep field order consistent between the dataclass and the constructor call; `llm_timeout` stays last.
@@ -194,7 +213,9 @@ from pathlib import Path
 
 from cv import MAX_EXPERIENCE_ENTRIES, MAX_PROJECT_ENTRIES, cv_to_id_text, load_cv, validate_selection
 
-FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")
+# A CV with room to choose from: the 1-experience/1-project `cv_sample.yaml` cannot distinguish
+# "the validator filtered correctly" from "the too-few-entries fallback replaced the selection".
+FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")
 
 
 def _cv():
@@ -224,10 +245,12 @@ def test_unknown_entry_is_dropped_with_a_warning():
 
 
 def test_bullet_under_the_wrong_entry_is_dropped():
+    # Two entries, so the too-few-entries fallback stays out of the way and the filtering is visible.
     cv = _cv()
     a, b = cv.experience[0], cv.experience[1]
     sel, warnings = validate_selection(cv, {
-        "experience": [{"id": a.id, "bullets": [b.bullets[0].id, a.bullets[0].id]}],
+        "experience": [{"id": a.id, "bullets": [b.bullets[0].id, a.bullets[0].id]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
         "projects": [], "skills": {},
     })
     assert sel["experience"][0]["bullets"] == [a.bullets[0].id]
@@ -236,19 +259,25 @@ def test_bullet_under_the_wrong_entry_is_dropped():
 
 def test_model_order_is_preserved():
     cv = _cv()
-    a = cv.experience[0]
-    ids = [b.id for b in a.bullets][:2]
-    sel, _ = validate_selection(cv, {"experience": [{"id": a.id, "bullets": list(reversed(ids))}],
-                                     "projects": [], "skills": {}})
-    assert sel["experience"][0]["bullets"] == list(reversed(ids))
+    a, b = cv.experience[0], cv.experience[1]
+    ids = [x.id for x in a.bullets][:2]
+    sel, _ = validate_selection(cv, {
+        "experience": [{"id": b.id, "bullets": [b.bullets[0].id]},
+                       {"id": a.id, "bullets": list(reversed(ids))}],
+        "projects": [], "skills": {}})
+    assert [e["id"] for e in sel["experience"]] == [b.id, a.id]
+    assert sel["experience"][1]["bullets"] == list(reversed(ids))
 
 
 def test_bullet_cap_keeps_the_first_n_in_the_given_order():
     cv = _cv()
-    entry = max(cv.projects, key=lambda p: len(p.bullets))
-    ids = [b.id for b in entry.bullets]
-    sel, _ = validate_selection(cv, {"experience": [], "projects": [{"id": entry.id, "bullets": ids}],
-                                     "skills": {}}, max_bullets=2)
+    fat = max(cv.projects, key=lambda p: len(p.bullets))
+    other = next(p for p in cv.projects if p.id != fat.id)
+    ids = [b.id for b in fat.bullets]
+    sel, _ = validate_selection(cv, {
+        "experience": [],
+        "projects": [{"id": fat.id, "bullets": ids}, {"id": other.id, "bullets": [other.bullets[0].id]}],
+        "skills": {}}, max_bullets=2)
     assert sel["projects"][0]["bullets"] == ids[:2]
 
 
@@ -294,13 +323,25 @@ def test_projects_fall_back_independently_of_experience():
 
 def test_duplicate_ids_are_collapsed():
     cv = _cv()
-    a = cv.experience[0]
+    a, b = cv.experience[0], cv.experience[1]
     bid = a.bullets[0].id
-    sel, _ = validate_selection(cv, {"experience": [{"id": a.id, "bullets": [bid, bid]},
-                                                    {"id": a.id, "bullets": [bid]}],
-                                     "projects": [], "skills": {}})
-    assert len(sel["experience"]) == 1
+    sel, warnings = validate_selection(cv, {
+        "experience": [{"id": a.id, "bullets": [bid, bid]}, {"id": a.id, "bullets": [bid]},
+                       {"id": b.id, "bullets": [b.bullets[0].id]}],
+        "projects": [], "skills": {}})
+    assert [e["id"] for e in sel["experience"]] == [a.id, b.id]
     assert sel["experience"][0]["bullets"] == [bid]
+    assert any("duplicate" in w for w in warnings)
+
+
+def test_a_single_surviving_entry_triggers_the_fallback():
+    # The other side of the coin the tests above avoid: one entry is not a resume section.
+    cv = _cv()
+    a = cv.experience[0]
+    sel, warnings = validate_selection(cv, {"experience": [{"id": a.id, "bullets": [a.bullets[0].id]}],
+                                            "projects": [], "skills": {}}, max_bullets=2)
+    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MAX_EXPERIENCE_ENTRIES]
+    assert any("fell back" in w for w in warnings)
 
 
 def test_selection_is_json_round_trippable():
@@ -321,7 +362,9 @@ def test_extra_key_in_cv_yaml_is_rejected():
         MasterCV.model_validate(raw)
 ```
 
-Check `tests/fixtures/cv_sample.yaml` first: these tests need at least 2 experience entries, at least 3 projects (one with 3+ bullets), and a non-empty `skills` mapping. Extend the fixture if it is smaller, keeping it valid under `MasterCV`.
+**Create `tests/fixtures/cv_tailor.yaml`** — do not touch `cv_sample.yaml`, which has one experience and one project and is what the Plan 1–3 tests are written against. The new fixture needs **3 experience entries** (ids `exp1`–`exp3`, each with 3+ bullets), **4 projects** (ids `proj1`–`proj4`, at least one with 4+ bullets, at least one with a `link` and a `demo`), a `summary`, one education entry, and a `skills` mapping with 2+ groups. Keep it valid under `MasterCV` (bullet ids prefixed by their entry id).
+
+Why a second fixture rather than a bigger `cv_sample.yaml`: with one entry per section, every selection test also trips the too-few-entries fallback, and a passing assertion cannot tell filtering from fallback. Tasks 6 and 7 use this fixture too.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -787,6 +830,16 @@ def test_html_is_escaped(cv, tmp_path):
     assert "<script>" not in html and "&lt;script&gt;" in html
 
 
+def test_project_links_are_rendered(cv, tmp_path):
+    from render import build_html
+    project = next(p for p in cv.projects if p.link)
+    html = build_html(cv, {"experience": [], "skills": {},
+                           "projects": [{"id": project.id, "bullets": [project.bullets[0].id]}]})
+    assert project.link in html
+    if project.demo:
+        assert project.demo in html
+
+
 def test_output_path_is_per_user_and_slugged(tmp_path):
     p = output_path(str(tmp_path), "ron", 42, "Goldman Sachs & Co.")
     assert p.endswith("/ron/42-goldman-sachs-co.pdf")
@@ -855,6 +908,12 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'render'`.
         {% if p.tech %}<span class="tech">{{ p.tech | join(', ') }}</span>{% endif %}
         {% if p.dates %}<span class="right">{{ p.dates }}</span>{% endif %}
       </div>
+      {% if p.link or p.demo %}
+      <div class="row"><span class="links">
+        {% if p.link %}<a href="{{ p.link }}">{{ p.link }}</a>{% endif %}
+        {% if p.demo %}{% if p.link %} · {% endif %}<a href="{{ p.demo }}">{{ p.demo }}</a>{% endif %}
+      </span></div>
+      {% endif %}
       <ul>{% for b in p.bullets %}<li>{{ b }}</li>{% endfor %}</ul>
     </div>
     {% endfor %}
@@ -891,6 +950,8 @@ header { margin-bottom: 6pt; }
 .sub { font-style: italic; }
 .right { color: #444; font-size: 8.5pt; white-space: nowrap; }
 .tech { font-size: 8.5pt; color: #444; }
+.links { font-size: 8pt; }
+.links a { color: #1a4f8a; text-decoration: none; }
 ul { margin: 1pt 0 0; padding-left: 12pt; }
 li { margin-bottom: 1pt; }
 .skills { margin: 1pt 0; }
@@ -964,7 +1025,9 @@ def build_context(cv: MasterCV, selection: dict) -> dict:
                               lambda e: {"company": e.company, "title": e.title,
                                          "dates": e.dates, "location": e.location}),
         "projects": _blocks(cv.projects, selection.get("projects", []),
-                            lambda p: {"name": p.name, "tech": p.tech, "dates": p.dates}),
+                            # link and demo are the whole point of a project entry on a resume.
+                            lambda p: {"name": p.name, "tech": p.tech, "dates": p.dates,
+                                       "link": p.link, "demo": p.demo}),
         "skills": selection.get("skills", {}),
     }
 
@@ -1055,7 +1118,7 @@ git commit -m "feat(render): Jinja2 + WeasyPrint one-page resume, page-count ove
 - Test: `tests/test_discord_client.py`
 
 **Interfaces:**
-- Produces: `format_match(..., matched: bool, overflow: bool = False, resume_missing: bool = False)`; `send_message` no longer raises on an unreadable PDF.
+- Produces: `format_match(..., matched: bool, overflow: bool = False, resume_missing: bool = False)`; `cap_content(header, lists, tail="", body="")`; `DeliveryResult.kind` gains `"attachment"`; `send_message` no longer raises on an unreadable PDF.
 
 **Why:** Plan 2 left `send_message`'s PDF branch raising `OSError` on a missing file — harmless while nothing set `pdf_path`, a crash loop the moment Task 7 does. `cap_content`'s `tail` parameter, unused until now, is what keeps the notice lines from being truncated away.
 
@@ -1091,9 +1154,51 @@ def test_notes_survive_an_oversized_gap_list():
     assert OVERFLOW_NOTE in msg and NO_RESUME_NOTE in msg
 
 
-def test_send_message_with_a_missing_pdf_is_invalid_not_an_exception(tmp_path):
+def test_notes_survive_an_oversized_reasoning():
+    # Nothing bounds reasoning: the prompt asks for under 400 characters, the schema does not.
+    msg = format_match("Stripe", "SWE", "SF", "https://x", 82, "r" * 2100, ["gap"], ["unknown"],
+                       matched=True, overflow=True, resume_missing=True)
+    assert len(msg) <= 2000
+    assert msg.startswith("🎯 82% — **Stripe** — SWE")
+    assert OVERFLOW_NOTE in msg and NO_RESUME_NOTE in msg
+
+
+def test_lists_are_dropped_before_the_reasoning_is():
+    # Spec order: gaps and unknowns are truncated first, the reasoning second.
+    msg = format_match("Stripe", "SWE", "SF", "https://x", 82, "r" * 1900, ["a confirmed gap"], [],
+                       matched=True)
+    assert len(msg) <= 2000
+    assert "r" * 1000 in msg
+    assert "a confirmed gap" not in msg
+
+
+def test_a_short_message_is_untouched():
+    msg = format_match("Stripe", "SWE", "SF", "https://x", 82, "short why", ["g"], ["u"], matched=True)
+    assert msg == ("🎯 82% — **Stripe** — SWE\n📍 SF\n🔗 https://x\n"
+                   "✅ Why: short why\n⚠️ Gaps: g\n❓ Not on CV: u")
+
+
+def test_send_message_with_a_missing_pdf_reports_an_attachment_failure(tmp_path):
     result = send_message("https://d/x", "hi", str(tmp_path / "gone.pdf"))
-    assert result.kind == "invalid" and "gone.pdf" in result.error
+    assert result.kind == "attachment" and "gone.pdf" in result.error
+
+
+def test_send_message_with_an_unreadable_pdf_reports_an_attachment_failure(tmp_path):
+    pdf = tmp_path / "locked.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    pdf.chmod(0o000)
+    try:
+        result = send_message("https://d/x", "hi", str(pdf))
+    finally:
+        pdf.chmod(0o644)
+    assert result.kind == "attachment"      # exists() is true; opening it is what fails
+
+
+def test_attachment_failure_makes_no_request(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr("discord_client.requests.post", lambda *a, **k: calls.append(1))
+    send_message("https://d/x", "hi", str(tmp_path / "gone.pdf"))
+    assert calls == []
 
 
 def test_send_message_attaches_the_pdf(monkeypatch, tmp_path):
@@ -1126,7 +1231,51 @@ OVERFLOW_NOTE = "📄 Resume ran over one page — trim before sending"
 NO_RESUME_NOTE = "⚠️ Couldn't generate resume — apply with your master CV."
 ```
 
-Extend `format_match`:
+and widen the kind union in `DeliveryResult`'s comment:
+
+```python
+    kind: str  # "ok" | "transient" | "gone" | "invalid" | "attachment"
+```
+
+Rewrite `cap_content` so the notes cannot be truncated away. Today the reasoning lives inside
+`header`; nothing bounds `ScoreResponse.reasoning`, so a 2,100-character one drives `remaining`
+negative, and the final `out[:MAX_CONTENT - 1]` cuts the tail — both notices — off the end. The
+reasoning becomes a separate, truncatable `body`:
+
+```python
+def cap_content(header: str, lists: list[str], tail: str = "", body: str = "") -> str:
+    """Join header + body + list lines + tail under MAX_CONTENT.
+
+    Priority when it does not fit: the header and the tail always survive. The tail carries the
+    resume notices, and the difference between "apply with this PDF" and "apply with your master
+    CV" must not be what gets dropped. List lines go first, then the body (the reasoning).
+    """
+    tail_cost = len(tail) + 1 if tail else 0
+    if len(header) + tail_cost > MAX_CONTENT:
+        # Pathological: even the header does not fit. It gives way, never the tail.
+        keep = MAX_CONTENT - tail_cost - 1
+        head = header[:keep] + _ELLIPSIS if keep > 0 else ""
+        return "\n".join(p for p in (head, tail) if p)
+
+    remaining = MAX_CONTENT - len(header) - tail_cost
+    kept_body = ""
+    if body and remaining > 2:
+        kept_body = body if len(body) + 1 <= remaining else body[: remaining - 2] + _ELLIPSIS
+        remaining -= len(kept_body) + 1
+
+    kept_lists = []
+    for line in lists:
+        if remaining <= 2:
+            break
+        if len(line) + 1 > remaining:
+            line = line[: remaining - 2] + _ELLIPSIS
+        kept_lists.append(line)
+        remaining -= len(line) + 1
+
+    return "\n".join(p for p in (header, kept_body, *kept_lists, tail) if p)
+```
+
+Extend `format_match` to feed it:
 
 ```python
 def format_match(
@@ -1134,11 +1283,9 @@ def format_match(
     score: int, reasoning: str, missing_confirmed: list[str], missing_unknown: list[str],
     matched: bool, overflow: bool = False, resume_missing: bool = False,
 ) -> str:
-    # The existing body is unchanged down to the `lists` list; only the return changes.
     icon = "🎯" if matched else "📉"
     header = f"{icon} {score}% — **{company}** — {role}\n📍 {location}\n🔗 {url}"
-    if reasoning:
-        header += f"\n✅ Why: {reasoning}"
+    body = f"✅ Why: {reasoning}" if reasoning else ""
     lists = []
     if missing_confirmed:
         lists.append("⚠️ Gaps: " + ", ".join(missing_confirmed))
@@ -1150,9 +1297,13 @@ def format_match(
         notes.append(NO_RESUME_NOTE)
     if overflow:
         notes.append(OVERFLOW_NOTE)
-    # `tail` is reserved before the lists are capped, so a long gaps list cannot swallow the notes.
-    return cap_content(header, lists, tail="\n".join(notes))
+    return cap_content(header, lists, tail="\n".join(notes), body=body)
 ```
+
+`format_link_only` does not change. Check the existing `cap_content` tests in
+`tests/test_discord_client.py` — the ones asserting that a long gaps list is truncated must still
+pass; the reasoning moving out of `header` is what makes them assert something different from before,
+so read each one and update the expectation deliberately rather than loosening the assertion.
 
 Make the attachment branch of `send_message` total:
 
@@ -1162,8 +1313,9 @@ Make the attachment branch of `send_message` total:
             try:
                 fh = open(pdf_path, "rb")
             except OSError as e:
-                # The row is deliverable without the PDF; the caller decides. Never crash the worker.
-                return DeliveryResult("invalid", None, f"cannot read {pdf_path}: {e}")
+                # A distinct kind, not "invalid": the message is fine, only the file is not, and
+                # `invalid` is retried forever. The worker drops the attachment and sends the rest.
+                return DeliveryResult("attachment", None, f"cannot read {pdf_path}: {e}")
             with fh:
                 resp = requests.post(...)   # unchanged
         else:
@@ -1204,7 +1356,13 @@ Add to `tests/test_worker.py`:
 from db import STAGE_RENDER, STAGE_SCORE, STAGE_TAILOR
 from worker import TAILOR_BUDGET
 
-SELECTION = {"experience": [{"id": "exp1", "bullets": ["exp1.b1"]}], "projects": [], "skills": {}}
+# Two entries per section, so the too-few-entries fallback does not quietly replace what the
+# fake returned. CV_SNAPSHOT is load_cv(tests/fixtures/cv_tailor.yaml).model_dump() (Task 2).
+SELECTION = {
+    "experience": [{"id": "exp1", "bullets": ["exp1.b1"]}, {"id": "exp2", "bullets": ["exp2.b1"]}],
+    "projects": [{"id": "proj1", "bullets": ["proj1.b1"]}, {"id": "proj2", "bullets": ["proj2.b1"]}],
+    "skills": {},
+}
 
 
 class FakeTailor:
@@ -1227,7 +1385,7 @@ def _tailor_ok(data=None):
 
 def _seed_tailorable(session, user_id="ron", **kw):
     ev = _seed(session, user_id, stage=STAGE_TAILOR, score=82, outcome="matched",
-               cv_snapshot=CV_SNAPSHOT, **kw)       # CV_SNAPSHOT: load_cv(FIXTURE).model_dump()
+               cv_snapshot=CV_SNAPSHOT, **kw)
     ev.job.description = "JOB DESCRIPTION TEXT"
     session.commit()
     return _resolve(session, ev)
@@ -1268,6 +1426,18 @@ def test_invalid_ids_are_dropped_before_storage(session_factory, session, clock,
     session.refresh(ev)
     ids = [e["id"] for e in ev.tailored["experience"]]
     assert "does-not-exist" not in ids and ids                # fell back to the master's order
+
+
+def test_giving_up_clears_a_previous_runs_pdf(session_factory, session, clock, tmp_path):
+    # Re-scoring an already-delivered row leaves the old PDF on the evaluation.
+    ev = _seed_tailorable(session, attempts=TAILOR_BUDGET - 1,
+                          pdf_path="/data/output/ron/1-stripe.pdf", page_overflow=True)
+    w = _worker_t(session_factory, FakeTailor(LLMResult("invalid", None, "bad", None, "pro", None, 1)),
+                  clock, tmp_path)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.pdf_path is None and ev.page_overflow is False
+    assert "Couldn't generate resume" in message_for(ev)
 
 
 def test_tailor_budget_exhausted_delivers_the_score_without_a_pdf(session_factory, session, clock, tmp_path):
@@ -1351,7 +1521,15 @@ def test_tailor_skipped_while_the_users_webhook_is_paused(session_factory, sessi
     assert w.run_once() is False and tailor.calls == []    # no tokens spent on an undeliverable row
 ```
 
-Write `_worker_t` / `_worker_st` next to the existing `_worker_s` helper, passing `tailor=`, `output_dir=str(tmp_path)` and `cvs={"ron": CV_SNAPSHOT, "cousin": CV_SNAPSHOT}`. Define `CV_SNAPSHOT` once at module level from `tests/fixtures/cv_sample.yaml` via `Path(__file__).parent`. The fixture's first experience entry must have id `exp1` with a bullet `exp1.b1` for `SELECTION` to validate; adjust the fixture or the constant so they agree.
+Write `_worker_t` / `_worker_st` next to the existing `_worker_s` helper, passing `tailor=`, `output_dir=str(tmp_path)` and `cvs={"ron": CV_SNAPSHOT, "cousin": CV_SNAPSHOT}`. Define `CV_SNAPSHOT` once at module level:
+
+```python
+CV_SNAPSHOT = load_cv(str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")).model_dump()
+```
+
+`SELECTION`'s ids must exist in that fixture (`exp1`/`exp1.b1`, `exp2`/`exp2.b1`, `proj1`, `proj2`) — Task 2 creates it with `exp1`–`exp3` and `proj1`–`proj4`, so they do. The Plan 1–3 tests keep using `cv_sample.yaml`; do not repoint them.
+
+`json` is needed at the top of this file for the snapshot-vs-live test's deep copies.
 
 - [ ] **Step 2: Run them to verify they fail**
 
@@ -1377,12 +1555,34 @@ Constructor gains `tailor=None, output_dir: str | None = None, max_bullets: int 
 Split the pause check used by both LLM stages:
 
 ```python
+    @staticmethod
+    def _model_name(client) -> str:
+        """The alias this client was configured with — the only thing pause keys are built from."""
+        return getattr(client, "model", "?")
+
     def _llm_paused(self, client) -> bool:
-        # "llm" is the endpoint (a 429/5xx holds both stages); "llm:<model>" is one bad alias or key.
-        return self.is_paused("llm") or self.is_paused(f"llm:{getattr(client, 'model', '?')}")
+        # "llm" is the endpoint (a 429/5xx holds both stages); "llm:<alias>" is one bad model or key.
+        return self.is_paused("llm") or self.is_paused(f"llm:{self._model_name(client)}")
 ```
 
-`_next_scoreable` uses `self._llm_paused(self._llm)` in place of `self.is_paused("llm")`. In `score()`, the `unavailable` branch pauses `f"llm:{self._llm_model_name()}"` instead of `"llm"`; the `transient` branch still pauses `"llm"`.
+`_next_scoreable` uses `self._llm_paused(self._llm)` in place of `self.is_paused("llm")`. In `score()`, both the `unavailable` branch **and** the invalid-streak breaker pause `f"llm:{self._model_name(self._llm)}"` instead of `"llm"` — both mean "this alias or key is wrong", which is per-model; the `transient` branch still pauses `"llm"`, which is the endpoint. Replace `_llm_model_name()` with `_model_name(self._llm)` throughout and delete the old helper.
+
+**Three Plan 3 tests assert the old key and must be updated** — this is a deliberate behaviour change, not a regression:
+- `test_score_unavailable_pauses_llm_without_consuming_attempt` (`tests/test_worker.py:843`)
+- `test_score_unavailable_resume_is_measured_from_after_the_call` (`tests/test_worker.py:795`)
+- the invalid-streak breaker assertion at `tests/test_worker.py:747`
+
+Each `w.paused["llm"]` in those three becomes `w.paused["llm:flash"]`, and `FakeLLM` gains `model = "flash"` so the key is a real alias rather than `"?"`. The **transient** assertions (`tests/test_worker.py:686`, `:711`, `:787`) keep `paused["llm"]` unchanged — verify that by reading each one, not by assuming. Add one new test proving the split:
+
+```python
+def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, session, clock, tmp_path):
+    _seed_scoreable(session, "ron")
+    _seed_tailorable(session, "cousin")
+    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), FakeTailor(), clock, tmp_path)
+    w.run_once()
+    assert w.is_paused("llm:flash") is True and w.is_paused("llm:pro") is False
+    assert w.run_once() is True          # the tailor row still moves
+```
 
 In `score()`'s success path, replace the matched branch:
 
@@ -1452,8 +1652,10 @@ Add the selector and the stage:
             ev.attempts -= 1                      # not this row's fault: hand the lease back
             resume = after + timedelta(seconds=LLM_PAUSE_SECONDS)
             ev.next_attempt_at = resume
-            self._pause(f"llm:{result.model or getattr(self._tailor, 'model', '?')}",
-                        resume, result.error or "unavailable")
+            # The CONFIGURED alias, never result.model. On a re-ask whose first call succeeded and
+            # whose second returned 401, LLMResult carries the backend's own model name — pausing
+            # that would write a key `_llm_paused` never reads, and the cooldown would do nothing.
+            self._pause(f"llm:{self._model_name(self._tailor)}", resume, result.error or "unavailable")
             return
 
         ev.last_error = result.error
@@ -1469,6 +1671,10 @@ Add the selector and the stage:
         """No PDF for this row. The score message still goes out; `outcome` stays as scored."""
         ev.resume_error = why
         ev.last_error = why
+        # A re-scored row can still be carrying the PREVIOUS run's PDF. Attaching it here would
+        # ship an old resume under a new score, and pdf_path being set would also suppress the
+        # "couldn't generate resume" notice. Clear it: this row has no resume.
+        ev.pdf_path, ev.page_overflow = None, False
         ev.stage, ev.attempts, ev.next_attempt_at = STAGE_DELIVER, 0, when
         log.warning("Evaluation %d: no tailored resume (%s)", ev.id, why)
 ```
@@ -1625,6 +1831,25 @@ def test_delivery_retry_reuses_the_same_pdf(session_factory, session, clock, tmp
     assert ev.stage == STAGE_CLOSED and Path(pdf).exists()
 
 
+def test_an_unreadable_pdf_degrades_to_the_score_message(session_factory, session, clock, tmp_path):
+    # exists() is true and open() fails: the path Task 7's precheck cannot see.
+    pdf = tmp_path / "locked.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path=str(pdf))
+    _resolve(session, ev)
+    sender = FakeSender(DeliveryResult("attachment", None, f"cannot read {pdf}: denied"), OK)
+    w = _worker(session_factory, sender, clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.pdf_path is None and ev.delivery_attempts == 0    # nothing was sent, nothing counted
+    assert ev.stage == STAGE_DELIVER
+    w.run_once()
+    session.refresh(ev)
+    assert sender.calls[1][2] is None and "Couldn't generate resume" in sender.calls[1][1]
+    assert ev.stage == STAGE_CLOSED
+
+
 def test_a_vanished_pdf_degrades_to_the_score_message(session_factory, session, clock, tmp_path):
     ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
                reasoning="why", pdf_path=str(tmp_path / "gone.pdf"))
@@ -1689,6 +1914,26 @@ def test_score_runs_before_tailor(session_factory, session, clock, tmp_path):
     w = _worker_st(session_factory, llm, tailor, clock, tmp_path)
     w.run_once()
     assert len(llm.calls) == 1 and tailor.calls == []
+```
+
+The worker helpers this task's tests use, written beside `_worker_s`:
+
+```python
+def _worker_t(session_factory, tailor, clock, tmp_path, cvs=None, users=(RON, COUSIN), sender=None):
+    return Worker(session_factory, list(users), cvs=cvs or {u.id: CV_SNAPSHOT for u in users},
+                  tailor=tailor, output_dir=str(tmp_path), now=clock,
+                  send=sender or FakeSender())
+
+
+def _worker_r(session_factory, renderer, clock, tmp_path, cvs=None, users=(RON, COUSIN), sender=None):
+    return Worker(session_factory, list(users), cvs=cvs or {u.id: CV_SNAPSHOT for u in users},
+                  output_dir=str(tmp_path), render=renderer, now=clock, send=sender or FakeSender())
+
+
+def _worker_st(session_factory, llm, tailor, clock, tmp_path, render=None, users=(RON, COUSIN)):
+    return Worker(session_factory, list(users), cvs={u.id: CV_SNAPSHOT for u in users},
+                  llm=llm, tailor=tailor, output_dir=str(tmp_path),
+                  render=render or FakeRenderer(1), now=clock, send=FakeSender())
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
@@ -1779,7 +2024,24 @@ def message_for(ev: Evaluation) -> str:
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 ```
 
-At the top of `deliver()`, before building the message:
+`deliver()` needs two changes. First, the attachment branch, added immediately after the existing
+`result.kind == "gone"` branch and before the generic failure handling — `deliver()` has no give-up,
+so anything the generic path handles is retried forever, and an unreadable file fails identically
+every time:
+
+```python
+        if result.kind == "attachment":
+            # No exists() check can cover permissions or a race with a cleanup. The message itself
+            # is fine: drop the attachment and send it on the next pass rather than looping on a
+            # file that will never open. No delivery attempt is counted — nothing was sent.
+            log.warning("Evaluation %d: %s; delivering without the resume", ev.id, result.error)
+            ev.resume_error = ev.resume_error or result.error
+            ev.pdf_path, ev.page_overflow = None, False
+            ev.next_attempt_at = self._now()
+            return
+```
+
+Second, the cheap precheck, at the top of `deliver()` before building the message:
 
 ```python
         if ev.pdf_path and not Path(ev.pdf_path).exists():
@@ -1911,7 +2173,39 @@ Expected: FAIL.
 
 - [ ] **Step 3: Wire it up**
 
-In `src/main.py`'s `build`, after the score client:
+Add the startup drain to `src/db.py`, beside `import_legacy_state`:
+
+```python
+def drain_resume_stages(session: Session) -> int:
+    """Move rows queued for tailoring or rendering to delivery.
+
+    Called only when this process has no tailor client or no output directory. Those rows were
+    queued by a build that did, and nothing in this process will ever pick them up; without this
+    they sit at their stage forever while the user waits for a notification that was already paid for.
+    """
+    rows = session.query(Evaluation).filter(Evaluation.stage.in_((STAGE_TAILOR, STAGE_RENDER))).all()
+    for ev in rows:
+        ev.resume_error = ev.resume_error or "tailoring not configured in this process"
+        ev.stage, ev.attempts = STAGE_DELIVER, 0
+        ev.pdf_path, ev.page_overflow = None, False
+        ev.next_attempt_at = utcnow()
+    return len(rows)
+```
+
+with its test in `tests/test_db.py`:
+
+```python
+def test_drain_resume_stages_moves_queued_rows_to_deliver(session_factory, session):
+    a = _eval_at(session, STAGE_TAILOR)          # small helper: an Evaluation at the given stage
+    b = _eval_at(session, STAGE_RENDER)
+    c = _eval_at(session, STAGE_SCORE)
+    assert drain_resume_stages(session) == 2
+    session.commit()
+    assert a.stage == b.stage == STAGE_DELIVER and c.stage == STAGE_SCORE
+    assert "not configured" in a.resume_error and a.pdf_path is None
+```
+
+Then in `src/main.py`'s `build`, after the score client:
 
 ```python
     tailor = LLMClient(settings.llm_base_url, settings.llm_api_key,
@@ -1922,6 +2216,20 @@ In `src/main.py`'s `build`, after the score client:
     return session_factory, Worker(session_factory, users, cvs=cvs, llm=llm, tailor=tailor,
                                    output_dir=output_dir, max_bullets=settings.max_bullets_per_entry)
 ```
+
+and, in the `with session_factory() as session:` block that already runs `ensure_feeds` and
+`import_legacy_state`, drain when this process cannot tailor:
+
+```python
+        if tailor is None or output_dir is None:
+            drained = drain_resume_stages(session)
+            if drained:
+                log.warning("Tailoring not configured: %d queued row(s) will be delivered "
+                            "with the score only", drained)
+```
+
+Note this requires `tailor` and `output_dir` to be computed before that block — move the two lines
+above it rather than adding a second session.
 
 Keep `build(..., llm=None, cvs=None)`'s injectability and add `tailor=None` the same way, so tests can pass fakes.
 
@@ -1963,11 +2271,22 @@ SELECT tailor_model, COUNT(*) FROM evaluations WHERE tailor_model IS NOT NULL GR
 ```
 
 - A line under the existing calibration note: the tailor prompt is separate from `SCORE_SYSTEM`, so calibration-week rubric changes do not touch it.
-- Manual re-render of one row (after fixing a template):
+- Manual re-render of one row (after fixing a template) — the stored selection is reused, no LLM call:
 ```sql
-UPDATE evaluations SET stage='render', attempts=0, pdf_path=NULL, resume_error=NULL,
+UPDATE evaluations SET stage='render', attempts=0, pdf_path=NULL, page_overflow=0,
+       resume_error=NULL, next_attempt_at=datetime('now') WHERE id = <id>;
+```
+- **Re-scoring a row (after a CV or rubric change) must clear every downstream artifact.** A bare
+  `stage='score'` leaves the previous run's selection and PDF attached, and if tailoring then fails
+  the row ships the old resume under the new score:
+```sql
+UPDATE evaluations SET stage='score', outcome=NULL, attempts=0,
+       cv_snapshot=NULL, tailored=NULL, pdf_path=NULL, page_overflow=0, resume_error=NULL,
+       score=NULL, reasoning=NULL, missing_confirmed=NULL, missing_unknown=NULL,
        next_attempt_at=datetime('now') WHERE id = <id>;
 ```
+  Clearing `cv_snapshot` is what makes the re-score read the edited CV; leaving it would re-score
+  against the old one. Update the Plan 3 manual-retry snippet in this file the same way.
 
 In the spec, record the two amendments under "Data model": (1) `tailor_failed`/`render_failed` are not `outcome` values — `outcome` stays `matched` and the reason goes in the new `resume_error` column, because `outcome` is write-once and `matched` is written at scoring time; (2) `evaluations.attempts` counts attempts at the current stage and resets on every transition.
 
@@ -1988,6 +2307,31 @@ git commit -m "feat(main): tailor client and output dir; e2e pipeline test; Plan
 - Re-ask second-call-fails and 429-without-`Retry-After` tests → Task 3.
 - cwd-dependent `load_cv("tests/fixtures/...")` paths → Task 8.
 - **`MasterCV` gains no required field in this plan** — in-flight `cv_snapshot`s must keep validating.
+
+## Review round — changes made after the first draft
+
+Six defects and two smaller gaps found reviewing the draft against the current code. All were
+accepted; each is folded into the task that owns it, not bolted on at the end.
+
+| # | Defect | Where it is now fixed |
+|---|---|---|
+| 1 | An unreadable (not merely missing) PDF made `send_message` return `invalid`, which `deliver()` retries forever — there is no delivery give-up by design. | Task 5 returns a distinct `"attachment"` kind; Task 7's `deliver()` drops the attachment and sends the score message. |
+| 2 | `_give_up_resume` left `pdf_path` set, so a re-scored row could attach the **previous** run's PDF under a new score — and a set `pdf_path` also suppressed the "couldn't generate resume" notice. | Task 7 clears `pdf_path`/`page_overflow`; Task 8's runbook clears every downstream artifact when re-scoring. |
+| 3 | The tailor cooldown keyed on `result.model`. Through a re-ask whose first call succeeded and whose second returned 401, that is the backend's model name, not the configured alias — so the worker paused a key `_llm_paused` never reads. | Task 6 builds every pause key from the configured alias; response model names stay in the logs. |
+| 4 | "Never parked at a stage nothing can run" was not true for rows already queued at `tailor`/`render` when a process has no tailor client. | Task 8 adds `db.drain_resume_stages`, called from `build`. `LLM_TAILOR_MODEL` stays required — no disable flag was added. |
+| 5 | `cap_content` truncates the whole message last, so a long reasoning (nothing bounds `ScoreResponse.reasoning`) erased both notices — the difference between "apply with this PDF" and "apply with your master CV". | Task 5 rewrites `cap_content` with the reasoning as a truncatable `body`; header and tail always survive. |
+| 6 | The filtering tests selected one entry each, which the too-few-entries fallback replaces — so they asserted against their own rule. `cv_sample.yaml` has one experience and one project, which is what manufactured the collision. | Task 2 adds `tests/fixtures/cv_tailor.yaml` (3 experience, 4 projects) and those tests now select two entries; Task 6's `SELECTION` likewise. |
+| 7 | The renderer dropped each project's `link` and `demo`. | Task 4 renders both. |
+| 8 | `MAX_BULLETS_PER_ENTRY=0` disabled the per-entry stopping condition while still emptying the fallback slice. | Task 1 rejects anything below 1 at startup. |
+
+Two consequences worth stating plainly, because they are behaviour changes rather than fixes:
+
+- **Three Plan 3 tests change.** The score stage's `unavailable` branch and its invalid-streak
+  breaker now pause `llm:<alias>` rather than `llm`. Task 6 names the three tests and the three
+  transient ones that must *not* change.
+- **`cap_content`'s output shifts for long messages.** The reasoning is no longer inside the
+  protected header. Task 5 says to read each existing `cap_content` test and update the
+  expectation deliberately.
 
 ## Still open after this plan
 
