@@ -25,7 +25,7 @@ from db import (
 from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from llm import LLMResult
-from render import output_path, render_pdf
+from render import RenderResult, output_path, render_pdf
 from users import User
 
 log = logging.getLogger(__name__)
@@ -59,7 +59,9 @@ def message_for(ev: Evaluation) -> str:
             job.company, job.role, job.location, job.url, ev.score, ev.reasoning or "",
             ev.missing_confirmed or [], ev.missing_unknown or [],
             matched=ev.outcome == "matched",
-            overflow=bool(ev.page_overflow and ev.pdf_path),
+            # Only a match ever has a resume; gate on outcome too so a stray manual UPDATE that
+            # leaves page_overflow/pdf_path set on a non-matched row can't surface the note.
+            overflow=bool(ev.page_overflow and ev.pdf_path and ev.outcome == "matched"),
             # Only a match promises a resume; a below-threshold notice never had one.
             resume_missing=ev.outcome == "matched" and ev.pdf_path is None and ev.resume_error is not None,
         )
@@ -94,6 +96,7 @@ class Worker:
         self._now = now
         self._fetch_not_before: datetime | None = None
         self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
+        self._tailor_invalid_streak = 0   # own counter — never shared with score()'s _invalid_streak
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -138,6 +141,11 @@ class Worker:
 
         Rows queued for tailoring or rendering by a process that had a tailor client would sit
         forever in one that does not. Move them to delivery so the score still reaches the user.
+
+        `main.build()` always constructs a `tailor` client and `output_dir` together, so in
+        production this drain guards a directly-constructed `Worker` (tests, one-off scripts) —
+        not the Plan 4 -> Plan 3 rollback path, which the runbook SQL in docs/ops.md covers
+        instead (an older Plan 3 image has no tailor/render selectors at all to drain into).
         """
         if self._tailoring_enabled:
             return
@@ -365,6 +373,10 @@ class Worker:
                 ev.attempts = 0            # the budget belongs to the stage, not the row
             else:
                 ev.outcome = "below_threshold"
+                # A re-scored row (docs/ops.md's re-fetch path) can still be carrying a previous
+                # run's tailored selection and PDF. A below-threshold row has no resume: clear
+                # them the way _give_up_resume does, or the old resume ships under the new score.
+                ev.tailored, ev.pdf_path, ev.page_overflow, ev.resume_error = None, None, False, None
                 ev.stage = STAGE_DELIVER if user.notify_below_threshold else STAGE_CLOSED
             ev.next_attempt_at = after
             return
@@ -406,7 +418,7 @@ class Worker:
     # -- render stage ---------------------------------------------------------
 
     def _next_renderable(self, session: Session) -> Evaluation | None:
-        if self._output_dir is None:
+        if not self._tailoring_enabled:
             return None
         now = self._now()
         candidates = (
@@ -460,7 +472,7 @@ class Worker:
     # -- tailor stage ---------------------------------------------------------
 
     def _next_tailorable(self, session: Session) -> Evaluation | None:
-        if self._tailor is None or self._llm_paused(self._tailor):
+        if not self._tailoring_enabled or self._llm_paused(self._tailor):
             return None
         now = self._now()
         candidates = (
@@ -502,6 +514,18 @@ class Worker:
                  ev.id, ev.user_id, result.model or getattr(self._tailor, "model", "?"),
                  result.kind, result.ms, f" error={result.error}" if result.error else "")
 
+        if result.kind == "invalid":
+            # A model that does not honour JSON mode costs two billed calls per _ask; without a
+            # breaker here TAILOR_BUDGET burns the pricier model with no cooldown between rows.
+            # A counter of its own — score()'s _invalid_streak must not be touched by tailor().
+            self._tailor_invalid_streak += 1
+            if self._tailor_invalid_streak >= INVALID_STREAK_LIMIT:
+                self._tailor_invalid_streak = 0
+                self._pause(f"llm:{self._model_name(self._tailor)}", after + timedelta(seconds=LLM_PAUSE_SECONDS),
+                            f"{INVALID_STREAK_LIMIT} consecutive invalid replies — model/schema mismatch?")
+        else:
+            self._tailor_invalid_streak = 0
+
         if result.ok:
             selection, warnings = validate_selection(cv, result.data.model_dump(), self._max_bullets)
             for w in warnings:
@@ -512,13 +536,19 @@ class Worker:
             return
 
         if result.kind == "unavailable":
-            ev.attempts -= 1                      # not this row's fault: hand the lease back
+            # Unlike score() — where nothing has been produced yet and the lease goes back — a
+            # wrong/renamed LLM_TAILOR_MODEL alias will not fix itself on retry. Keeping the lease
+            # here is what lets the row reach TAILOR_BUDGET and degrade via _give_up_resume instead
+            # of looping forever at attempts==0.
             resume = after + timedelta(seconds=LLM_PAUSE_SECONDS)
-            ev.next_attempt_at = resume
             # The CONFIGURED alias, never result.model. On a re-ask whose first call succeeded and
             # whose second returned 401, LLMResult carries the backend's own model name — pausing
             # that would write a key `_llm_paused` never reads, and the cooldown would do nothing.
             self._pause(f"llm:{self._model_name(self._tailor)}", resume, result.error or "unavailable")
+            if ev.attempts >= TAILOR_BUDGET:
+                self._give_up_resume(ev, after, result.error or "unavailable")
+                return
+            ev.next_attempt_at = resume
             return
 
         ev.last_error = result.error
@@ -550,14 +580,18 @@ class Worker:
             self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml")
             return
 
-        if ev.pdf_path and not Path(ev.pdf_path).exists():
+        # Only a match ever gets a resume attached — belt-and-braces against any manual UPDATE
+        # (see docs/ops.md's re-fetch note) that leaves pdf_path set on a non-matched row.
+        pdf_path = ev.pdf_path if ev.outcome == "matched" else None
+        if pdf_path and not Path(pdf_path).exists():
             # The volume was wiped or the file was cleaned up: send what we still have.
-            log.warning("Evaluation %d: resume %s is gone; delivering without it", ev.id, ev.pdf_path)
+            log.warning("Evaluation %d: resume %s is gone; delivering without it", ev.id, pdf_path)
             ev.resume_error = ev.resume_error or "resume file missing at delivery"
             ev.pdf_path = None
+            pdf_path = None
 
         try:
-            result = self._send(user.discord_webhook, message_for(ev), ev.pdf_path)
+            result = self._send(user.discord_webhook, message_for(ev), pdf_path)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
             log.exception("Sender raised for evaluation %d", ev.id)
             result = DeliveryResult("transient", None, f"{type(e).__name__}: {e}")

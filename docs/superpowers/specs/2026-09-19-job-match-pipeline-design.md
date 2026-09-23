@@ -126,7 +126,7 @@ A row reaches `closed` in exactly two ways: Discord confirms the final message (
 **Plan 4 amendments:**
 
 1. `tailor_failed` and `render_failed` are not `outcome` values. `outcome` stays `matched` (`outcome` is write-once, and `matched` is already written at scoring time, before tailoring or rendering run) and the reason a resume is missing goes in the `resume_error` column instead.
-2. `evaluations.attempts` counts attempts at the *current* stage, not across the row's lifetime, and resets to 0 on every stage transition (score → tailor → render → deliver). `delivery_attempts` remains its own separate counter, as described above.
+2. `evaluations.attempts` counts attempts at the *current* stage, not across the row's lifetime, and resets to 0 on every transition into a stage that meters attempts (score → tailor → render). A transition that instead falls back to a fixed outcome — the score budget running out, or landing below threshold — moves the row straight to `deliver` without resetting `attempts`, since nothing reads it there. `delivery_attempts` remains its own separate counter, as described above.
 
 ### Migration from current state files
 

@@ -43,11 +43,13 @@ SELECT fetch_status, COUNT(*) FROM jobs GROUP BY 1;
 ```sql
 UPDATE jobs SET fetch_status='pending', fetch_attempts=0, fetch_first_attempt_at=NULL,
        next_attempt_at=datetime('now') WHERE id = <job id>;
-UPDATE evaluations SET outcome=NULL, stage='score', attempts=0, next_attempt_at=datetime('now')
+UPDATE evaluations SET outcome=NULL, stage='score', attempts=0,
+       tailored=NULL, pdf_path=NULL, page_overflow=0, resume_error=NULL,
+       next_attempt_at=datetime('now')
 WHERE job_id = <job id> AND stage != 'closed';
 ```
 
-The evaluation has to go back to `score`: a row left at `deliver` would be sent link-only as soon as the re-fetch lands, so it must be re-queued for scoring to benefit from the new description.
+The evaluation has to go back to `score`: a row left at `deliver` would be sent link-only as soon as the re-fetch lands, so it must be re-queued for scoring to benefit from the new description. Clearing `tailored`/`pdf_path`/`page_overflow`/`resume_error` matters too: a row already tailored and rendered (waiting at `deliver` behind a paused webhook, say) still has a PDF from the old description, and re-scoring below threshold must not ship it — see "Calibration week" below for the full statement and why.
 
 The worker only fetches jobs that still have an open (non-`closed`) evaluation. If the job's evaluations were already delivered, the reset has no effect.
 
@@ -129,7 +131,7 @@ UPDATE evaluations SET stage='score', outcome=NULL, attempts=0,
 
 ## Deploying Plan 4
 
-1. **Server prep.** Add `LLM_TAILOR_MODEL=deepseek-v4-pro` and `MAX_BULLETS_PER_ENTRY=4` to `~/deployed-projects/internship-tracker/.env`; the container creates `data/output/<user>/` itself. Confirm the alias exists:
+1. **Server prep.** Add `LLM_TAILOR_MODEL=deepseek-v4-pro` and `MAX_BULLETS_PER_ENTRY=4` to `~/deployed-projects/internship-tracker/.env`; the container creates `data/output/<user>/` itself. Nothing prunes `data/output/`: rendered PDFs accumulate there indefinitely, including orphans left behind once `pdf_path` is cleared (a re-tailor, a below-threshold re-score, a manual re-render). Confirm the alias exists:
 
 ```bash
 curl -s -H "Authorization: Bearer $LLM_API_KEY" $LLM_BASE_URL/models | python3 -c "import json,sys; print([m['id'] for m in json.load(sys.stdin)['data']])"

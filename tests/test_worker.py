@@ -644,6 +644,20 @@ def test_score_below_threshold_delivers_when_user_opted_in(session_factory, sess
     assert ev.stage == STAGE_CLOSED and sender.calls[0][1].startswith("📉 59%")
 
 
+def test_below_threshold_clears_a_previous_runs_resume_fields(session_factory, session, clock):
+    # A re-fetched, re-scored row can still be carrying a prior tailor+render run's artifacts
+    # (docs/ops.md's re-fetch statement resets stage='score' but historically left these set).
+    # A below-threshold row has no resume: clear them here too, the way _give_up_resume does.
+    ev = _seed_scoreable(session, tailored={"experience": []}, pdf_path="/x/old.pdf",
+                         page_overflow=True, resume_error="stale")
+    w = _worker_s(session_factory, FakeLLM(_llm_ok(40)), clock)
+    w.run_once()
+    session.refresh(ev)
+    assert ev.outcome == "below_threshold"
+    assert ev.tailored is None and ev.pdf_path is None
+    assert ev.page_overflow is False and ev.resume_error is None
+
+
 def test_score_uses_user_threshold(session_factory, session, clock):
     ev = _seed_scoreable(session, "cousin")
     strict = COUSIN.model_copy(update={"threshold": 90})
@@ -934,6 +948,11 @@ def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, sess
 from db import STAGE_RENDER, STAGE_TAILOR
 from worker import TAILOR_BUDGET
 
+
+def test_stage_tailor_and_render_values_are_pinned():
+    # These strings are persisted in tracker.db and referenced by runbook SQL — load-bearing.
+    assert STAGE_TAILOR == "tailor" and STAGE_RENDER == "render"
+
 # Two entries per section, so the too-few-entries fallback does not quietly replace what the
 # fake returned. CV_SNAPSHOT is load_cv(tests/fixtures/cv_tailor.yaml).model_dump() (Task 2).
 CV_SNAPSHOT = load_cv(str(Path(__file__).parent / "fixtures" / "cv_tailor.yaml")).model_dump()
@@ -1061,13 +1080,55 @@ def test_tailor_unavailable_pauses_only_its_own_model(session_factory, session, 
     assert w.is_paused("llm") is False          # scoring keeps running on the flash model
 
 
-def test_unavailable_tailor_gives_the_lease_back(session_factory, session, clock, tmp_path):
+def test_unavailable_tailor_consumes_the_lease(session_factory, session, clock, tmp_path):
+    # Unlike score(), an unavailable tailor result must NOT hand the lease back: a wrong/renamed
+    # alias would otherwise loop forever at attempts==0 and never reach TAILOR_BUDGET.
     ev = _seed_tailorable(session)
     w = _worker_t(session_factory, FakeTailor(LLMResult("unavailable", None, "401", None, None, None, 1)),
                   clock, tmp_path)
     w.run_once()
     session.refresh(ev)
-    assert ev.attempts == 0 and ev.stage == STAGE_TAILOR
+    assert ev.attempts == 1 and ev.stage == STAGE_TAILOR
+    assert ev.next_attempt_at == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+    assert w.paused["llm:pro"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+
+
+def test_persistently_unavailable_tailor_degrades_to_delivered_score(session_factory, session, clock, tmp_path):
+    # A wrong LLM_TAILOR_MODEL alias must not park the match forever: after TAILOR_BUDGET rounds
+    # (each behind its own LLM_PAUSE_SECONDS cooldown) the row degrades via _give_up_resume and
+    # the score still reaches the user.
+    ev = _seed_tailorable(session)
+    down = LLMResult("unavailable", None, "HTTP 404: no such model", None, None, None, 5)
+    tailor = FakeTailor(down, down, down)
+    sender = FakeSender(OK)
+    w = _worker_t(session_factory, tailor, clock, tmp_path, send=sender)
+    for _ in range(TAILOR_BUDGET):
+        assert w.run_once() is True
+        session.refresh(ev)
+        if ev.stage == STAGE_TAILOR:
+            clock.advance(LLM_PAUSE_SECONDS)
+    assert ev.stage == STAGE_DELIVER and ev.outcome == "matched"
+    assert "404" in ev.resume_error
+    assert len(tailor.calls) == TAILOR_BUDGET
+    assert w.run_once() is True             # delivers instead of looping back to tailor
+    session.refresh(ev)
+    assert ev.stage == STAGE_CLOSED
+    assert sender.calls[0][2] is None and "Couldn't generate resume" in sender.calls[0][1]
+
+
+def test_tailor_invalid_streak_pauses_its_own_model(session_factory, session, clock, tmp_path):
+    # Mirrors test_invalid_streak_pauses_llm for the score stage: tailor() must keep its own
+    # counter, not share score()'s _invalid_streak, and pause the tailor alias, not "llm".
+    for uid in ("ron", "cousin", "dana"):
+        _seed_tailorable(session, uid)
+    invalid = LLMResult("invalid", None, "bad json", None, "pro", None, 1)
+    tailor = FakeTailor(invalid, invalid, invalid)
+    w = _worker_t(session_factory, tailor, clock, tmp_path, users=(RON, COUSIN, DANA))
+    assert INVALID_STREAK_LIMIT == 3
+    w.run_once(); w.run_once()
+    assert "llm:pro" not in w.paused
+    w.run_once()
+    assert w.paused["llm:pro"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
 
 
 def test_over_budget_on_restart_makes_no_call(session_factory, session, clock, tmp_path):
@@ -1114,6 +1175,17 @@ def test_tailor_skipped_while_the_users_webhook_is_paused(session_factory, sessi
     assert w.run_once() is False and tailor.calls == []    # no tokens spent on an undeliverable row
 
 
+def test_tailor_selector_requires_output_dir_too(session_factory, session, clock, tmp_path):
+    # A tailor client without an output_dir must not start tailoring a row: doing so would hand
+    # it to STAGE_RENDER, and _next_renderable requires output_dir too — a latent strand.
+    ev = _seed_tailorable(session)
+    w = Worker(session_factory, [RON, COUSIN], cvs={"ron": CV_SNAPSHOT, "cousin": CV_SNAPSHOT},
+               tailor=FakeTailor(), output_dir=None, now=clock, send=FakeSender())
+    assert w.run_once() is False
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
+
+
 # --- render and delivery of the PDF -----------------------------------------
 
 from worker import RENDER_BUDGET
@@ -1142,8 +1214,11 @@ def _seed_renderable(session, user_id="ron", **kw):
 
 
 def _worker_r(session_factory, renderer, clock, tmp_path, cvs=None, users=(RON, COUSIN), sender=None):
+    # tailor=FakeTailor() only so _tailoring_enabled is true and _next_renderable picks the row up
+    # (it now agrees with score()'s routing predicate); these tests never call the tailor client.
     return Worker(session_factory, list(users), cvs=cvs or {u.id: CV_SNAPSHOT for u in users},
-                  output_dir=str(tmp_path), render=renderer, now=clock, send=sender or FakeSender())
+                  tailor=FakeTailor(), output_dir=str(tmp_path), render=renderer, now=clock,
+                  send=sender or FakeSender())
 
 
 def test_render_writes_the_pdf_and_moves_to_deliver(session_factory, session, clock, tmp_path):
@@ -1230,6 +1305,25 @@ def test_delivery_retry_reuses_the_same_pdf(session_factory, session, clock, tmp
     session.refresh(ev)
     assert [c[2] for c in sender.calls] == [str(pdf), str(pdf)]
     assert ev.stage == STAGE_CLOSED and Path(pdf).exists()
+
+
+def test_below_threshold_after_rerender_ships_without_the_stale_pdf(session_factory, session, clock, tmp_path):
+    # The failure sequence from docs/ops.md's re-fetch path: a row waiting at deliver behind a
+    # paused webhook has a tailored+rendered PDF from a prior run (pdf_path set, page_overflow
+    # True); re-scoring lands it below threshold. It must deliver with no attachment and no
+    # overflow note, regardless of what a manual UPDATE left on the row.
+    pdf = tmp_path / "stale.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=40, outcome="below_threshold",
+               reasoning="why", pdf_path=str(pdf), page_overflow=True)
+    _resolve(session, ev)
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()
+    session.refresh(ev)
+    assert sender.calls[0][2] is None                       # no attachment
+    assert "ran over one page" not in sender.calls[0][1]    # no overflow note
+    assert sender.calls[0][1].startswith("📉 40%")
+    assert ev.stage == STAGE_CLOSED
 
 
 def test_an_unreadable_pdf_degrades_to_the_score_message(session_factory, session, clock, tmp_path):
