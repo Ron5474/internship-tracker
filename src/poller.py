@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from sqlalchemy.orm import Session
 
 from config import FeedSpec
-from db import STAGE_SCORE, Evaluation, Feed, Job
+from db import STAGE_SCORE, Evaluation, Feed, FeedPost, Job
 from parser import parse_sections, url_key
-from users import User
+from users import User, webhook_key
 
 log = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ class PollResult:
     sha_changed: bool
     jobs_added: int
     evaluations_added: int
+    feed_posts_added: int = 0
 
 
 def poll_feed(
@@ -47,7 +48,7 @@ def poll_feed(
     known = {k for (k,) in session.query(Job.url_key).filter_by(feed_id=feed.id).all()}
     # A feed with no jobs is always seeded silently, whatever last_sha says.
     seeding = previous_sha is None or not known
-    jobs_added = evals_added = 0
+    jobs_added = evals_added = posts_added = 0
     for section, rows in parse_sections(readme).items():
         for row in rows:
             key = url_key(row["url"])
@@ -64,14 +65,28 @@ def poll_feed(
                 evals = _evaluations_for(job, spec.name, section, users)
                 session.add_all(evals)
                 evals_added += len(evals)
+                posts = _feed_posts_for(job, spec.name, section, users)
+                session.add_all(posts)
+                posts_added += len(posts)
 
     feed.last_sha = current_sha
     session.commit()
-    log.info("[%s] %s → %s: +%d jobs, +%d evaluations%s",
+    log.info("[%s] %s → %s: +%d jobs, +%d evaluations, +%d feed posts%s",
              spec.name, (previous_sha or "none")[:7], current_sha[:7], jobs_added, evals_added,
-             " (seeded)" if seeding else "")
-    return PollResult(True, jobs_added, evals_added)
+             posts_added, " (seeded)" if seeding else "")
+    return PollResult(True, jobs_added, evals_added, posts_added)
 
 
 def _evaluations_for(job: Job, feed_name: str, section: str, users: list[User]) -> list[Evaluation]:
     return [Evaluation(job=job, user_id=u.id, stage=STAGE_SCORE) for u in users if u.wants(feed_name, section)]
+
+
+def _feed_posts_for(job: Job, feed_name: str, section: str, users: list[User]) -> list[FeedPost]:
+    """One row per distinct destination, not per user.
+
+    Users sharing a channel share its key, so the set collapses them. Sorted so a poll
+    writes rows in a deterministic order.
+    """
+    keys = {webhook_key(u.feed_webhook) for u in users
+            if u.feed_webhook and u.wants(feed_name, section)}
+    return [FeedPost(job=job, webhook_key=key) for key in sorted(keys)]

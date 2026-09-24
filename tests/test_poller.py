@@ -1,9 +1,9 @@
 import pytest
 
 from config import FeedSpec
-from db import Evaluation, Feed, Job, ensure_feeds, STAGE_SCORE
+from db import Evaluation, Feed, FeedPost, Job, ensure_feeds, STAGE_SCORE
 from poller import poll_feed
-from users import User
+from users import User, webhook_key
 
 SPEC = FeedSpec("internships", "a/b", "dev")
 
@@ -138,3 +138,58 @@ def test_failure_mid_poll_writes_nothing(db, monkeypatch):
     db.rollback()
     assert db.query(Job).count() == 2
     assert db.query(Feed).filter_by(name="internships").one().last_sha == "s1"
+
+
+SHARED = "https://d/1"        # _user() already points every user at this webhook
+
+FEED_RON = RON.model_copy(update={"discord_webhook_private": "https://d/private"})
+
+
+def test_a_new_posting_creates_one_feed_post_per_destination(db):
+    # Two users, same shared channel: one post, not two.
+    sam = FEED_RON.model_copy(update={"id": "sam"})
+    poll_feed(db, SPEC, [FEED_RON, sam], *_github("s1", README_V1))
+    result = poll_feed(db, SPEC, [FEED_RON, sam], *_github("s2", README_V2))
+    assert [p.webhook_key for p in db.query(FeedPost).all()] == [webhook_key(SHARED)]
+    assert result.feed_posts_added == 1
+
+
+def test_two_different_channels_each_get_a_post(db):
+    elsewhere = FEED_RON.model_copy(update={"id": "sam", "discord_webhook": "https://d/other"})
+    poll_feed(db, SPEC, [FEED_RON, elsewhere], *_github("s1", README_V1))
+    result = poll_feed(db, SPEC, [FEED_RON, elsewhere], *_github("s2", README_V2))
+    assert result.feed_posts_added == 2
+    assert db.query(FeedPost).count() == 2
+
+
+def test_a_user_without_a_private_webhook_gets_no_feed_post(db):
+    # RON has not opted in: one webhook already receives everything, so a feed post
+    # would deliver the same posting twice.
+    poll_feed(db, SPEC, [RON], *_github("s1", README_V1))
+    result = poll_feed(db, SPEC, [RON], *_github("s2", README_V2))
+    assert result.jobs_added == 1 and result.feed_posts_added == 0
+    assert db.query(FeedPost).count() == 0
+
+
+def test_seeding_creates_no_feed_posts(db):
+    # The first poll inserts a feed's whole history. Announcing that would post thousands
+    # of old jobs into the shared channel.
+    result = poll_feed(db, SPEC, [FEED_RON], *_github("s1", README_V1))
+    assert result.jobs_added == 2 and result.feed_posts_added == 0
+    assert db.query(FeedPost).count() == 0
+
+
+def test_feed_posts_follow_the_section_filter(db):
+    # The new row in README_V2 is a software role; this user only watches quant.
+    picky = FEED_RON.model_copy(update={"sections": ["quantitative finance"]})
+    poll_feed(db, SPEC, [picky], *_github("s1", README_V1))
+    result = poll_feed(db, SPEC, [picky], *_github("s2", README_V2))
+    assert result.jobs_added == 1 and result.feed_posts_added == 0
+
+
+def test_a_job_already_known_creates_no_second_feed_post(db):
+    poll_feed(db, SPEC, [FEED_RON], *_github("s1", README_V1))
+    poll_feed(db, SPEC, [FEED_RON], *_github("s2", README_V2))
+    before = db.query(FeedPost).count()
+    poll_feed(db, SPEC, [FEED_RON], *_github("s3", README_V2))   # same README, new SHA
+    assert db.query(FeedPost).count() == before
