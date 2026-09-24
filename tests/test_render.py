@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from cv import load_cv
-from render import output_path, render_pdf
+from render import build_html, output_path, render_pdf
 
 # cv_tailor.yaml (Task 2), not cv_sample.yaml: these tests slice two experience entries and two
 # projects, need a project carrying a `link` and a `demo`, and need enough content that the
@@ -59,10 +59,54 @@ def test_only_selected_bullets_are_rendered(cv, tmp_path):
 
 
 def test_education_and_summary_always_come_from_the_master(cv, tmp_path):
+    # Education is rendered as rows, not model objects, but every entry still survives
+    # in the master's order no matter what the selection said.
     from render import build_context
     ctx = build_context(cv, {"experience": [], "projects": [], "skills": {}})
-    assert [e.id for e in ctx["education"]] == [e.id for e in cv.education]
+    assert [e["school"] for e in ctx["education"]] == [e.school for e in cv.education]
     assert ctx["summary"] == cv.summary
+
+
+def test_education_row_carries_the_degree_and_its_details(cv):
+    from render import build_context
+    entry = next(e for e in cv.education if e.details)
+    row = next(r for r in build_context(cv, {})["education"] if r["school"] == entry.school)
+    assert row["degree"].startswith(entry.degree)
+    for detail in entry.details:
+        assert detail in row["degree"]
+    assert row["dates"] == entry.dates
+
+
+def test_contact_renders_profiles_by_name_not_url(cv):
+    html = build_html(cv, {"experience": [], "projects": [], "skills": {}})
+    assert f'<a href="{cv.contact.linkedin}">LinkedIn</a>' in html
+    assert f'<a href="{cv.contact.github}">GitHub</a>' in html
+    assert cv.contact.email in html                      # plain text, not a link
+    assert f'<a href="{cv.contact.email}"' not in html
+
+
+def test_skills_render_as_one_list_without_group_names(cv):
+    html = build_html(cv, {"experience": [], "projects": [],
+                           "skills": {k: v for k, v in cv.skills.items()}})
+    for group in cv.skills:
+        assert f"{group}:" not in html                    # no "languages:" label on the page
+    for skill in cv.skills["languages"]:
+        assert skill in html
+
+
+def test_flat_skills_keeps_order_and_drops_duplicates():
+    from render import _flat_skills
+    assert _flat_skills({"a": ["Python", "Go"], "b": ["Go", "Rust"]}) == ["Python", "Go", "Rust"]
+
+
+def test_project_tech_is_not_rendered(cv):
+    # The master resume this layout copies keeps tech detail inside the bullets; a separate
+    # tech line is what pushed the page over. Dropping it is deliberate, so pin it.
+    project = next(p for p in cv.projects if p.tech)
+    html = build_html(cv, {"experience": [], "skills": {},
+                           "projects": [{"id": project.id, "bullets": [project.bullets[0].id]}]})
+    assert project.name in html
+    assert ", ".join(project.tech) not in html
 
 
 def test_selection_order_is_the_render_order(cv, tmp_path):

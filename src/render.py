@@ -32,10 +32,58 @@ def output_path(output_dir: str, user_id: str, job_id: int, company: str) -> str
     return str(Path(output_dir) / user_id / f"{job_id}-{slug}.pdf")
 
 
-def _contact_line(cv: MasterCV) -> str:
+def _contact_parts(cv: MasterCV) -> list[dict]:
+    """The header line, as pieces the template joins with pipes.
+
+    Email, phone and location are plain text; the profile URLs render as their names,
+    because "LinkedIn" reads better on paper than the URL it points at.
+    """
     c = cv.contact
-    parts = [c.email, c.phone, c.location, c.linkedin, c.github]
-    return " · ".join(p for p in parts if p)
+    parts: list[dict] = [{"text": t} for t in (c.email, c.phone, c.location) if t]
+    if c.linkedin:
+        parts.append({"text": "LinkedIn", "href": c.linkedin})
+    if c.github:
+        parts.append({"text": "GitHub", "href": c.github})
+    return parts
+
+
+def _education_rows(cv: MasterCV) -> list[dict]:
+    """School, then degree with its details (a GPA, usually) on one line, then dates."""
+    rows = []
+    for e in cv.education:
+        detail = " | ".join(e.details) if e.details else ""
+        rows.append({
+            "school": e.school,
+            "degree": f"{e.degree} | {detail}" if detail else e.degree,
+            "dates": e.dates,
+        })
+    return rows
+
+
+def _flat_skills(skills: dict) -> list[str]:
+    """One comma-separated run, not a list per group.
+
+    The group names (languages, frameworks, tools) exist so the tailor step can keep its
+    selection inside a category; they are scaffolding, and printing them wastes two lines
+    of a one-page resume.
+    """
+    seen, out = set(), []
+    for group in skills.values():
+        for skill in group:
+            if skill not in seen:
+                seen.add(skill)
+                out.append(skill)
+    return out
+
+
+def _project_links(project) -> list[dict]:
+    links = []
+    if project.link:
+        label = "GitHub" if "github.com" in project.link.lower() else "Link"
+        links.append({"text": label, "href": project.link})
+    if project.demo:
+        links.append({"text": "Demo", "href": project.demo})
+    return links
 
 
 def _blocks(entries, chosen, extra):
@@ -56,17 +104,19 @@ def _blocks(entries, chosen, extra):
 def build_context(cv: MasterCV, selection: dict) -> dict:
     return {
         "name": cv.name,
-        "contact_line": _contact_line(cv),
+        "contact": _contact_parts(cv),
         "summary": cv.summary,
-        "education": cv.education,                       # always the master's, in full
+        "education": _education_rows(cv),                # always the master's, in full
         "experience": _blocks(cv.experience, selection.get("experience", []),
                               lambda e: {"company": e.company, "title": e.title,
                                          "dates": e.dates, "location": e.location}),
         "projects": _blocks(cv.projects, selection.get("projects", []),
-                            # link and demo are the whole point of a project entry on a resume.
-                            lambda p: {"name": p.name, "tech": p.tech, "dates": p.dates,
-                                       "link": p.link, "demo": p.demo}),
-        "skills": selection.get("skills", {}),
+                            # Links are the whole point of a project entry on a resume; `tech`
+                            # is deliberately not rendered — the master resume this layout
+                            # copies keeps that detail inside the bullets.
+                            lambda p: {"name": p.name, "dates": p.dates,
+                                       "links": _project_links(p)}),
+        "skills": _flat_skills(selection.get("skills", {})),
     }
 
 
