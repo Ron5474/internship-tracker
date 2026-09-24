@@ -18,6 +18,7 @@ from db import (
     STAGE_SCORE,
     STAGE_TAILOR,
     Evaluation,
+    FeedPost,
     Job,
     drain_resume_stages,
     utcnow,
@@ -26,12 +27,13 @@ from discord_client import DeliveryResult, format_link_only, format_match, send_
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from llm import LLMResult
 from render import UNDERFILL_BELOW, RenderResult, attachment_name, output_path, render_pdf
-from users import User
+from users import User, webhook_key
 
 log = logging.getLogger(__name__)
 
 BACKOFF_SECONDS = (30, 60, 300, 900, 3600)
 DELIVERY_BUDGET = 10
+FEED_BUDGET = 10
 FETCH_BUDGET = 5
 FETCH_MAX_AGE_HOURS = 24
 FETCH_GAP_SECONDS = 2
@@ -93,6 +95,9 @@ class Worker:
     ) -> None:
         self._sessions = session_factory
         self._users = {u.id: u for u in users}
+        # key -> URL, so a feed_posts row can be resolved without storing the secret.
+        self._feed_webhooks = {webhook_key(u.feed_webhook): u.feed_webhook
+                               for u in users if u.feed_webhook}
         self._cvs = dict(cvs or {})
         self._llm = llm
         self._tailor = tailor
@@ -176,12 +181,18 @@ class Worker:
                 time.sleep(idle_sleep)
 
     def run_once(self) -> bool:
-        # Ready messages first, then cheap network, then local CPU, then the cheap LLM
-        # call, then the expensive one.
+        # Ready messages first (private results, then the public feed slot — one HTTP call,
+        # so a posting reaches the shared channel within seconds), then cheap network, then
+        # local CPU, then the cheap LLM call, then the expensive one.
         with self._sessions() as session:
             ev = self._next_deliverable(session)
             if ev is not None:
                 self.deliver(session, ev)
+                session.commit()
+                return True
+            post = self._next_feed_post(session)
+            if post is not None:
+                self.post_feed(session, post)
                 session.commit()
                 return True
             job = self._next_fetchable(session)
@@ -235,6 +246,54 @@ class Worker:
             if not self.is_paused(f"discord:{ev.user_id}"):
                 return ev
         return None
+
+    def _next_feed_post(self, session: Session) -> FeedPost | None:
+        if not self._feed_webhooks:
+            return None
+        now = self._now()
+        candidates = (
+            session.query(FeedPost)
+            .filter(FeedPost.sent_at.is_(None),
+                    FeedPost.next_attempt_at <= now,
+                    FeedPost.webhook_key.in_(self._feed_webhooks))
+            .order_by(FeedPost.next_attempt_at, FeedPost.id)
+            .all()
+        )
+        for post in candidates:
+            if not self.is_paused(f"feed:{post.webhook_key}"):
+                return post
+        return None
+
+    def post_feed(self, session: Session, post: FeedPost) -> None:
+        """Announce one job to one channel: the link, nothing about the candidate."""
+        webhook = self._feed_webhooks[post.webhook_key]
+        job = post.job
+        content = format_link_only(job.company, job.role, job.location, job.url)
+        try:
+            result = self._send(webhook, content)
+        except Exception as e:  # noqa: BLE001 — a sender bug is a failed attempt, not a dead worker
+            log.exception("Sender raised for feed post %d", post.id)
+            result = DeliveryResult("transient", None, f"{type(e).__name__}: {e}")
+
+        if result.ok:
+            post.sent_at = self._now()
+            post.error = None
+            log.info("feed post=%d job=%d: %s — %s", post.id, job.id, job.company, job.role)
+            return
+
+        if result.kind == "gone":
+            self._pause(f"feed:{post.webhook_key}", None, result.error or "feed webhook gone")
+            return
+
+        post.attempts += 1
+        post.error = result.error
+        delay = result.retry_after if result.retry_after is not None else backoff(post.attempts)
+        post.next_attempt_at = self._now() + timedelta(seconds=delay)
+        level = logging.ERROR if post.attempts > FEED_BUDGET else logging.WARNING
+        log.log(level, "Feed post %d failed (attempt %d, %s): %s; retry in %ss",
+                post.id, post.attempts, result.kind, result.error, delay)
+        if result.kind == "transient":
+            self._pause(f"feed:{post.webhook_key}", post.next_attempt_at, result.error or result.kind)
 
     def _next_scoreable(self, session: Session) -> Evaluation | None:
         if self._llm is None or self._llm_paused(self._llm):
@@ -610,7 +669,7 @@ class Worker:
             pdf_path = None
 
         try:
-            result = self._send(user.discord_webhook, message_for(ev), pdf_path,
+            result = self._send(user.results_webhook, message_for(ev), pdf_path,
                                 self._attachment_name(ev) if pdf_path else None)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
             log.exception("Sender raised for evaluation %d", ev.id)
