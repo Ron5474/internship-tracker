@@ -1,20 +1,70 @@
-@page { size: letter; margin: 0.5in; }
+/* Layout copied from the master resume: Arial 10pt, a 19pt centred name, and centred
+   section headings in navy under a rule. Liberation Sans is metric-compatible with Arial
+   and is what the container actually has installed. */
 
-body { font-family: "DejaVu Sans", sans-serif; font-size: 9.5pt; line-height: 1.25; color: #111; }
-h1 { font-size: 17pt; margin: 0; letter-spacing: 0.5pt; }
-h2 { font-size: 10.5pt; text-transform: uppercase; letter-spacing: 0.6pt;
-     border-bottom: 0.7pt solid #444; margin: 9pt 0 4pt; padding-bottom: 1pt; }
-header { margin-bottom: 6pt; }
-.contact { font-size: 8.5pt; color: #444; margin: 2pt 0 0; }
-.summary { margin: 0 0 2pt; }
-.entry { margin-bottom: 5pt; }
-.row { display: flex; justify-content: space-between; }
-.left { font-weight: bold; }
-.sub { font-style: italic; }
-.right { color: #444; font-size: 8.5pt; white-space: nowrap; }
-.tech { font-size: 8.5pt; color: #444; }
-.links { font-size: 8pt; }
-.links a { color: #1a4f8a; text-decoration: none; }
-ul { margin: 1pt 0 0; padding-left: 12pt; }
+@page { size: letter; margin: 0.4in 0.35in; }
+
+body {
+  font-family: "Liberation Sans", Arial, "DejaVu Sans", sans-serif;
+  font-size: 10pt;
+  line-height: 1.15;
+  color: #000;
+  margin: 0;
+}
+
+/* --- header --- */
+
+h1 {
+  font-size: 19pt;
+  font-weight: bold;
+  text-align: center;
+  margin: 0;
+}
+
+.contact {
+  font-size: 9pt;
+  text-align: center;
+  margin: 2pt 0 0;
+}
+
+a { color: #1155cc; text-decoration: underline; }
+
+/* --- sections --- */
+
+h2 {
+  font-size: 12pt;
+  font-weight: bold;
+  text-align: center;
+  color: #1c4587;
+  border-top: 1.5pt solid #1c4587;
+  margin: 6pt 0 2pt;
+  padding-top: 2pt;
+}
+
+section { break-inside: auto; }
+
+/* --- entry rows --- */
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8pt;
+}
+
+.school { font-weight: bold; flex: 0 0 30%; }
+.degree { flex: 1 1 auto; font-style: italic; }
+.dates { flex: 0 0 auto; white-space: nowrap; text-align: right; }
+.heading { flex: 1 1 auto; }
+
+.entry { margin-bottom: 5pt; break-inside: avoid; }
+.entry:last-child { margin-bottom: 0; }
+
+/* --- bullets --- */
+
+ul { margin: 1pt 0 0; padding-left: 13pt; }
 li { margin-bottom: 1pt; }
-.skills { margin: 1pt 0; }
+
+/* --- text blocks --- */
+
+.skills, .summary { margin: 0; text-align: justify; }
