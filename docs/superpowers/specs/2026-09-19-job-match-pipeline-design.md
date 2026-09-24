@@ -327,7 +327,9 @@ Fetch or score failed (no score, no PDF):
 🔗 https://...
 ```
 
-Nothing is sent for below-threshold scores.
+Nothing is sent for below-threshold scores unless `notify_below_threshold` is set (Plan 3), in which case the below-threshold message goes wherever matches go for that user (Plan 5: the private destination).
+
+**Plan 5 amendment:** a user may configure two destinations instead of one. `discord_webhook` is always the public, link-only feed — every matching posting, tracked in `feed_posts` and keyed on the destination (`webhook_key`, a hash of the URL) rather than on the user, so several users sharing one channel produce a single announcement. `discord_webhook_private`, when set, is where everything derived from the candidate's CV goes instead: match and below-threshold notices with their score and reasoning, and the tailored resume PDF. A user with no `discord_webhook_private` keeps the Plan 1 behaviour exactly — one webhook, everything, no feed posts — so the split is opt-in per user, not a global change in delivery shape.
 
 ## Configuration
 

@@ -351,3 +351,36 @@ def test_build_constructs_both_clients_with_their_own_models(tmp_path, monkeypat
     assert worker._tailor.model == "pro"
     assert worker._max_bullets == 3
     assert worker._output_dir == str(tmp_path / "output")
+
+
+def test_a_posting_reaches_the_feed_and_the_match_reaches_the_private_channel(tmp_path, session_factory, monkeypatch):
+    """The whole point of this plan, proved once end to end."""
+    users = [RON.model_copy(update={"discord_webhook_private": "https://d/private"})]
+    _poll_one_posting(session_factory, users, monkeypatch)
+    with session_factory() as session:
+        job = session.query(Job).one()
+        job.description, job.fetch_status = "We need a Python engineer.", FETCH_OK
+        session.commit()
+
+    worker, llm, tailor, sender = _pipeline(tmp_path, session_factory, users, {"ron": CV_SNAPSHOT})
+
+    # Bounded drain: run_once() until it reports nothing left, capped so a future regression
+    # that stops the queue from ever draining fails the test instead of hanging the suite.
+    for _ in range(20):
+        if not worker.run_once():
+            break
+    else:
+        pytest.fail("worker did not drain within 20 iterations")
+    assert worker.run_once() is False   # confirm the queue actually drained
+
+    by_webhook = {}
+    for webhook, content, pdf, _name in sender.calls:
+        by_webhook.setdefault(webhook, []).append((content, pdf))
+
+    feed = by_webhook[users[0].discord_webhook]
+    assert len(feed) == 1 and feed[0][0].startswith("🆕") and feed[0][1] is None
+    assert "%" not in feed[0][0]                      # no score ever reaches the shared channel
+
+    private = by_webhook["https://d/private"]
+    assert len(private) == 1 and private[0][0].startswith("🎯")
+    assert private[0][1] is not None                  # the PDF went here

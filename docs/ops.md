@@ -217,3 +217,29 @@ UPDATE evaluations SET stage='render', attempts=0, pdf_path=NULL, page_overflow=
 ```
 
 8. **Re-scoring a row (after a CV or rubric change) must clear every downstream artifact**, not just `stage='score'` — see "Calibration week" above for why and the exact statement.
+
+## Split destinations
+
+Set `discord_webhook_private` for a user and their `discord_webhook` splits in two:
+
+- **`discord_webhook`** becomes a public, link-only feed. Every matching posting gets one 🆕 announcement here — company, role, location, link. No score, no reasoning, no resume, ever.
+- **`discord_webhook_private`** gets everything derived from the candidate's CV: 🎯/📉 scores, reasoning, missing qualifications, and the tailored resume PDF for a match.
+
+Leave `discord_webhook_private` unset and nothing changes: the user's single `discord_webhook` keeps receiving everything, exactly as before the split existed. **The split is opt-in per user** — one user having it configured has no effect on any other user, including others sharing the same public webhook.
+
+**Enabling it never backfills.** Feed posts are created only for postings discovered by a poll *after* `discord_webhook_private` is set and the worker restarted; nothing already in the database is announced retroactively. A user switching on the split does not dump their history into a channel other people are reading. The change takes effect on the next poll cycle.
+
+`feed_posts` is keyed on `(job_id, webhook_key)`, not on the user — `webhook_key` is a hash of the destination URL (see `users.webhook_key`). If several users point `discord_webhook` at the same channel, that channel gets one 🆕 post per job, not one per user.
+
+```sql
+-- feed posts waiting to go out
+SELECT COUNT(*) FROM feed_posts WHERE sent_at IS NULL;
+
+-- feed posts that keep failing
+SELECT id, job_id, attempts, substr(error,1,60) FROM feed_posts
+WHERE sent_at IS NULL AND attempts > 0 ORDER BY attempts DESC;
+
+-- re-send one announcement
+UPDATE feed_posts SET sent_at=NULL, attempts=0, error=NULL,
+       next_attempt_at=CURRENT_TIMESTAMP WHERE id = <id>;
+```

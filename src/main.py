@@ -89,6 +89,10 @@ def main() -> None:
     log.info("Tracker starting: %d users, feeds %s, interval %ds",
              len(users), list(FEEDS), settings.poll_interval)
 
+    split = [u.id for u in users if u.feed_webhook]
+    if split:
+        log.info("Public feed enabled for: %s (results go to their private webhooks)", ", ".join(split))
+
     # Bring pre-pipeline state files to version 2 first (PR #1). Retry until GitHub answers.
     internships = FEEDS["internships"]
     while not migrate_state(settings.data_dir,

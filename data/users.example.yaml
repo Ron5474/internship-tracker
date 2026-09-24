@@ -7,3 +7,7 @@
   # Calibration: true delivers below-threshold postings too, with their score, so you can
   # judge the scoring. Set false once you trust it.
   notify_below_threshold: false
+  # Optional. Set this and the split begins: `discord_webhook` above becomes a public,
+  # link-only feed of every matching posting, and scores, gaps and tailored resumes go
+  # here instead. Leave it out and everything goes to the one webhook, as before.
+  discord_webhook_private: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
