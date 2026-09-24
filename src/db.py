@@ -110,6 +110,9 @@ class Evaluation(Base):
     # Why a match went out without a PDF. Diagnostic; `outcome` stays "matched".
     resume_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     page_overflow: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Percent of the page the rendered resume fills. Overflow's counterpart: a resume that
+    # comes out short is worth saying so, and nothing else would notice.
+    page_fill: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

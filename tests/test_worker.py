@@ -31,8 +31,9 @@ class FakeSender:
         self.results = list(results)
         self.calls = []
 
-    def __call__(self, webhook, content, pdf_path=None):
-        self.calls.append((webhook, content, pdf_path))
+    def __call__(self, webhook, content, pdf_path=None, filename=None):
+        # Existing tests index calls positionally, so the attachment name goes on the end.
+        self.calls.append((webhook, content, pdf_path, filename))
         return self.results.pop(0) if self.results else DeliveryResult("ok", None, None)
 
 
@@ -226,7 +227,7 @@ def test_sender_exception_counts_as_transient_attempt(session_factory, session, 
     # e.g. the PDF vanished from disk: a failed attempt with backoff, not a worker crash.
     ev = _resolve(session, _seed(session))
 
-    def boom(webhook, content, pdf_path=None):
+    def boom(webhook, content, pdf_path=None, filename=None):
         raise OSError("no such file")
 
     w = _worker(session_factory, boom, clock)
@@ -1435,3 +1436,63 @@ def test_startup_is_a_no_op_when_tailoring_is_configured(session_factory, sessio
     _worker_t(session_factory, FakeTailor(), clock, tmp_path).startup()
     session.refresh(ev)
     assert ev.stage == STAGE_TAILOR
+
+
+def test_render_records_the_page_fill(session_factory, session, clock, tmp_path):
+    from render import RenderResult
+    ev = _seed_renderable(session)
+
+    def renderer(cv, selection, out_path):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"%PDF stub")
+        return RenderResult(out_path, 1, 0.62)
+
+    _worker_r(session_factory, renderer, clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.page_fill == 62
+
+
+def test_a_short_resume_says_so_in_the_message(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path="/x/r.pdf", page_fill=62)
+    assert "fills only 62%" in message_for(ev)
+
+
+def test_a_full_resume_says_nothing_about_the_page(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               reasoning="why", pdf_path="/x/r.pdf", page_fill=97)
+    msg = message_for(ev)
+    assert "fills only" not in msg and "ran over" not in msg
+
+
+def test_a_below_threshold_row_never_mentions_the_page(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=40, outcome="below_threshold",
+               reasoning="why", pdf_path="/x/r.pdf", page_fill=40)
+    assert "fills only" not in message_for(ev)
+
+
+def test_delivery_names_the_attachment_after_the_job(session_factory, session, clock, tmp_path):
+    pdf = tmp_path / "2665-rtx.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               pdf_path=str(pdf), cv_snapshot=CV_SNAPSHOT)
+    ev.job.company, ev.job.role = "RTX", "Software Engineer Intern"
+    session.commit()
+    _resolve(session, ev)
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()
+
+    webhook, content, pdf_path, filename = sender.calls[0]
+    assert pdf_path == str(pdf)                      # the file on disk keeps its job id
+    assert filename.endswith("_Resume_RTX_Software_Engineer_Intern.pdf")
+
+
+def test_delivery_falls_back_to_the_file_name_without_a_snapshot(session_factory, session, clock, tmp_path):
+    pdf = tmp_path / "2665-rtx.pdf"
+    pdf.write_bytes(b"%PDF stub")
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched",
+               pdf_path=str(pdf), cv_snapshot=None)
+    _resolve(session, ev)
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()
+    assert sender.calls[0][3] is None

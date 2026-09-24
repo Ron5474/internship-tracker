@@ -25,7 +25,7 @@ from db import (
 from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from llm import LLMResult
-from render import RenderResult, output_path, render_pdf
+from render import UNDERFILL_BELOW, RenderResult, attachment_name, output_path, render_pdf
 from users import User
 
 log = logging.getLogger(__name__)
@@ -52,6 +52,13 @@ def backoff(attempt: int) -> int:
     return BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS)) - 1]
 
 
+def _underfill(ev: Evaluation) -> int | None:
+    """The fill percentage, when the resume came out short enough to be worth saying."""
+    if ev.outcome != "matched" or not ev.pdf_path or ev.page_fill is None:
+        return None
+    return ev.page_fill if ev.page_fill < UNDERFILL_BELOW * 100 else None
+
+
 def message_for(ev: Evaluation) -> str:
     job = ev.job
     if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
@@ -64,6 +71,7 @@ def message_for(ev: Evaluation) -> str:
             overflow=bool(ev.page_overflow and ev.pdf_path and ev.outcome == "matched"),
             # Only a match promises a resume; a below-threshold notice never had one.
             resume_missing=ev.outcome == "matched" and ev.pdf_path is None and ev.resume_error is not None,
+            underfill=_underfill(ev),
         )
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
@@ -465,9 +473,10 @@ class Worker:
 
         after = self._now()
         ev.pdf_path, ev.page_overflow = result.path, result.overflow
+        ev.page_fill = round(result.fill * 100)
         ev.stage, ev.attempts, ev.next_attempt_at = STAGE_DELIVER, 0, after
-        log.info("render ev=%d user=%s pages=%d overflow=%s path=%s",
-                 ev.id, ev.user_id, result.pages, result.overflow, result.path)
+        log.info("render ev=%d user=%s pages=%d fill=%d%% overflow=%s path=%s",
+                 ev.id, ev.user_id, result.pages, ev.page_fill, result.overflow, result.path)
 
     # -- tailor stage ---------------------------------------------------------
 
@@ -573,6 +582,16 @@ class Worker:
 
     # -- deliver stage ------------------------------------------------------
 
+    @staticmethod
+    def _attachment_name(ev: Evaluation) -> str | None:
+        """What the PDF is called in Discord. None leaves the file's own name, which is a
+        worse download name but always correct — worth falling back to rather than guessing."""
+        snapshot = ev.cv_snapshot if isinstance(ev.cv_snapshot, dict) else {}
+        name = snapshot.get("name")
+        if not name:
+            return None
+        return attachment_name(name, ev.job.company, ev.job.role)
+
     def deliver(self, session: Session, ev: Evaluation) -> None:
         user = self._users.get(ev.user_id)
         if user is None:
@@ -591,7 +610,8 @@ class Worker:
             pdf_path = None
 
         try:
-            result = self._send(user.discord_webhook, message_for(ev), pdf_path)
+            result = self._send(user.discord_webhook, message_for(ev), pdf_path,
+                                self._attachment_name(ev) if pdf_path else None)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
             log.exception("Sender raised for evaluation %d", ev.id)
             result = DeliveryResult("transient", None, f"{type(e).__name__}: {e}")

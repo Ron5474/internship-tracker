@@ -17,14 +17,40 @@ _env = Environment(
 )
 
 
+# Below this share of the page, a one-page resume has enough white space that another
+# project or a few more bullets would be a better use of it.
+UNDERFILL_BELOW = 0.85
+
+
 @dataclass(frozen=True)
 class RenderResult:
     path: str
     pages: int
+    fill: float = 1.0          # share of the last page the content occupies, 0-1
 
     @property
     def overflow(self) -> bool:
         return self.pages > 1
+
+    @property
+    def underfilled(self) -> bool:
+        """One page with room to spare. Overflow's opposite, and just as worth knowing:
+        a sparse resume goes out looking thin and nothing else would notice."""
+        return self.pages == 1 and self.fill < UNDERFILL_BELOW
+
+
+def attachment_name(cv_name: str, company: str, role: str) -> str:
+    """The name the PDF arrives under in Discord.
+
+    The file on disk keeps its job id, which is what makes a re-render overwrite the right
+    file and keeps two postings from the same company apart. This is only what the download
+    is called, and there it wants to read like something you would attach to an application.
+    """
+    def part(text: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]+", "_", text or "").strip("_")
+
+    pieces = [p for p in (part(cv_name), "Resume", part(company), part(role)) if p]
+    return "_".join(pieces)[:120] + ".pdf"
 
 
 def output_path(output_dir: str, user_id: str, job_id: int, company: str) -> str:
@@ -131,4 +157,19 @@ def render_pdf(cv: MasterCV, selection: dict, out_path: str) -> RenderResult:
         stylesheets=[CSS(filename=str(TEMPLATE_DIR / "resume.css"))]
     )
     document.write_pdf(out_path)
-    return RenderResult(out_path, len(document.pages))
+    return RenderResult(out_path, len(document.pages), _fill(document.pages[-1]))
+
+
+def _fill(page) -> float:
+    """How much of the last page the content occupies.
+
+    Reads WeasyPrint's laid-out box tree, which is private API — so any surprise there
+    reports a full page rather than raising, since a wrong "looks sparse" note is a worse
+    outcome than no note at all.
+    """
+    try:
+        box = page._page_box
+        bottom = max((c.position_y + (c.height or 0) for c in box.children), default=box.position_y)
+        return max(0.0, min(1.0, (bottom - box.position_y) / box.height))
+    except Exception:  # noqa: BLE001 — a measurement is not worth failing a render over
+        return 1.0
