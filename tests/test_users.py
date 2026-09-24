@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from users import User, load_users
+from users import User, load_users, webhook_key
 
 VALID = """\
 - id: ron
@@ -88,3 +88,33 @@ def test_notify_below_threshold_defaults_false():
 def test_notify_below_threshold_parsed():
     text = VALID.replace("  threshold: 60\n", "  threshold: 60\n  notify_below_threshold: true\n")
     assert load_users(_write(text))[0].notify_below_threshold is True
+
+
+def _user(**kw):
+    base = dict(id="ron", cv="/x", discord_webhook="https://d/shared",
+                feeds=["internships"], sections=["software"])
+    return User(**{**base, **kw})
+
+
+def test_without_a_private_webhook_everything_goes_to_the_one_destination():
+    u = _user()
+    assert u.results_webhook == "https://d/shared"
+    # No feed webhook: a single-destination user would otherwise get every posting twice.
+    assert u.feed_webhook is None
+
+
+def test_with_a_private_webhook_the_shared_one_becomes_the_feed():
+    u = _user(discord_webhook_private="https://d/private")
+    assert u.results_webhook == "https://d/private"
+    assert u.feed_webhook == "https://d/shared"
+
+
+def test_webhook_key_is_stable_and_not_the_url():
+    key = webhook_key("https://discord.com/api/webhooks/123/secret-token")
+    assert key == webhook_key("https://discord.com/api/webhooks/123/secret-token")
+    assert "secret-token" not in key and "discord" not in key
+    assert len(key) == 16
+
+
+def test_webhook_key_separates_different_destinations():
+    assert webhook_key("https://d/a") != webhook_key("https://d/b")

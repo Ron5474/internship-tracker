@@ -1,9 +1,20 @@
 from pathlib import Path
+import hashlib
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from config import FEEDS
+
+
+def webhook_key(url: str) -> str:
+    """A stable id for a destination that is safe to store.
+
+    The webhook URL is a credential — anyone holding it can post to the channel — so the
+    database records a hash of it. Truncated to 16 hex characters, which is far beyond
+    collision range for the handful of destinations one deployment has.
+    """
+    return hashlib.sha256(url.encode()).hexdigest()[:16]
 
 
 class User(BaseModel):
@@ -14,6 +25,7 @@ class User(BaseModel):
     sections: list[str] = Field(min_length=1)
     threshold: int = 60
     notify_below_threshold: bool = False
+    discord_webhook_private: str | None = None
 
     @field_validator("feeds")
     @classmethod
@@ -31,6 +43,17 @@ class User(BaseModel):
     def wants(self, feed_name: str, section: str) -> bool:
         """Same matching rule the old FILTER_SECTIONS used: substring on the normalized heading."""
         return feed_name in self.feeds and any(s in section for s in self.sections)
+
+    @property
+    def results_webhook(self) -> str:
+        """Scores, gaps and resumes. Private when one is configured."""
+        return self.discord_webhook_private or self.discord_webhook
+
+    @property
+    def feed_webhook(self) -> str | None:
+        """The link-only public feed, and only when the destinations are actually split:
+        with one webhook it already receives everything, so a feed post would duplicate it."""
+        return self.discord_webhook if self.discord_webhook_private else None
 
 
 def load_users(path: str) -> list[User]:
