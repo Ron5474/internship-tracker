@@ -8,6 +8,7 @@ MAX_CONTENT = 2000
 _ELLIPSIS = "…"
 
 OVERFLOW_NOTE = "📄 Resume ran over one page — trim before sending"
+UNDERFILL_NOTE = "📏 Resume fills only {pct}% of the page — room for another project"
 NO_RESUME_NOTE = "⚠️ Couldn't generate resume — apply with your master CV."
 
 
@@ -33,6 +34,7 @@ def format_match(
     company: str, role: str, location: str, url: str,
     score: int, reasoning: str, missing_confirmed: list[str], missing_unknown: list[str],
     matched: bool, overflow: bool = False, resume_missing: bool = False,
+    underfill: int | None = None,
 ) -> str:
     icon = "🎯" if matched else "📉"
     header = f"{icon} {score}% — **{company}** — {role}\n📍 {location}\n🔗 {url}"
@@ -48,6 +50,9 @@ def format_match(
         notes.append(NO_RESUME_NOTE)
     if overflow:
         notes.append(OVERFLOW_NOTE)
+    elif underfill is not None:
+        # Never both: a resume cannot be simultaneously too long and too short.
+        notes.append(UNDERFILL_NOTE.format(pct=underfill))
     return cap_content(header, lists, tail="\n".join(notes), body=body)
 
 
@@ -89,8 +94,14 @@ def cap_content(header: str, lists: list[str], tail: str = "", body: str = "") -
     return "\n".join(p for p in (header, kept_body, *kept_lists, tail) if p)
 
 
-def send_message(webhook_url: str, content: str, pdf_path: str | None = None) -> DeliveryResult:
-    """POST to a Discord webhook with ?wait=true. Success is 200 with a message body only."""
+def send_message(webhook_url: str, content: str, pdf_path: str | None = None,
+                 filename: str | None = None) -> DeliveryResult:
+    """POST to a Discord webhook with ?wait=true. Success is 200 with a message body only.
+
+    `filename` is what the attachment is called in Discord, which need not match the file on
+    disk: the stored name carries a job id so re-rendering overwrites the right file, while
+    the download wants a name you would attach to an application.
+    """
     try:
         if pdf_path:
             try:
@@ -104,7 +115,7 @@ def send_message(webhook_url: str, content: str, pdf_path: str | None = None) ->
                     webhook_url,
                     params={"wait": "true"},
                     data={"payload_json": json.dumps({"content": content})},
-                    files={"files[0]": (Path(pdf_path).name, fh, "application/pdf")},
+                    files={"files[0]": (filename or Path(pdf_path).name, fh, "application/pdf")},
                     timeout=30,
                 )
         else:

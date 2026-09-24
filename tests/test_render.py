@@ -3,7 +3,8 @@ from pathlib import Path
 import pytest
 
 from cv import load_cv
-from render import build_html, output_path, render_pdf
+from render import (UNDERFILL_BELOW, attachment_name, build_html, output_path,
+                    render_pdf)
 
 # cv_tailor.yaml (Task 2), not cv_sample.yaml: these tests slice two experience entries and two
 # projects, need a project carrying a `link` and a `demo`, and need enough content that the
@@ -145,3 +146,66 @@ def test_render_creates_missing_directories(cv, tmp_path):
     out = output_path(str(tmp_path / "output"), "ron", 7, "Stripe")
     render_pdf(cv, _selection(cv), out)
     assert Path(out).exists()
+
+
+def test_fill_rises_with_content(cv, tmp_path):
+    # An absolute number would only measure how big this fixture happens to be; the fixture
+    # CV is small enough that even "everything" does not fill a page.
+    thin = render_pdf(cv, {"experience": [], "projects": [], "skills": {}}, str(tmp_path / "a.pdf"))
+    full = render_pdf(cv, {
+        "experience": [{"id": e.id, "bullets": [b.id for b in e.bullets]} for e in cv.experience],
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in cv.projects],
+        "skills": cv.skills,
+    }, str(tmp_path / "b.pdf"))
+    assert full.fill > thin.fill
+
+
+def test_underfilled_reads_the_threshold_and_the_page_count():
+    from render import RenderResult
+    assert RenderResult("p", 1, UNDERFILL_BELOW - 0.01).underfilled is True
+    assert RenderResult("p", 1, UNDERFILL_BELOW).underfilled is False
+    assert RenderResult("p", 2, 0.10).underfilled is False       # two pages is never "room to spare"
+
+
+def test_a_nearly_empty_resume_is_reported_as_underfilled(cv, tmp_path):
+    thin = {"experience": [], "projects": [], "skills": {}}
+    result = render_pdf(cv, thin, str(tmp_path / "r.pdf"))
+    assert result.pages == 1
+    assert result.fill < UNDERFILL_BELOW
+    assert result.underfilled is True
+
+
+def test_overflow_is_never_also_underfilled(cv, tmp_path):
+    fat = {
+        "experience": [{"id": e.id, "bullets": [b.id for b in e.bullets]} for e in cv.experience] * 6,
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in cv.projects] * 6,
+        "skills": cv.skills,
+    }
+    result = render_pdf(cv, fat, str(tmp_path / "r.pdf"))
+    assert result.overflow is True
+    assert result.underfilled is False          # more than one page is never "room to spare"
+
+
+def test_fill_falls_back_to_full_rather_than_raising():
+    # It reads WeasyPrint's private box tree; a surprise there must not fail a render, and a
+    # wrong "looks sparse" note is worse than no note.
+    from render import _fill
+
+    class Unhelpful:
+        @property
+        def _page_box(self):
+            raise AttributeError("moved in a new version")
+
+    assert _fill(Unhelpful()) == 1.0
+
+
+def test_attachment_name_reads_like_something_you_would_send():
+    assert attachment_name("Ronak Patel", "RTX", "Software Engineer Intern") == \
+        "Ronak_Patel_Resume_RTX_Software_Engineer_Intern.pdf"
+
+
+def test_attachment_name_survives_punctuation_and_length():
+    name = attachment_name("Ronak Patel", "Goldman Sachs & Co.", "SWE Intern - Summer 2027")
+    assert name == "Ronak_Patel_Resume_Goldman_Sachs_Co_SWE_Intern_Summer_2027.pdf"
+    long_name = attachment_name("A B", "C" * 200, "D" * 200)
+    assert len(long_name) <= 124 and long_name.endswith(".pdf")
