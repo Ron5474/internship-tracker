@@ -128,6 +128,11 @@ def cv_to_text(cv: MasterCV) -> str:
 
 MAX_EXPERIENCE_ENTRIES = 4
 MAX_PROJECT_ENTRIES = 3
+# Floors, not targets. They only bind when the model under-selects, and exist because a
+# sparse section is a worse resume than an untailored one: two-thirds of a skills list is
+# what automated screens match against, and a single-entry section reads as an error.
+MIN_ENTRIES = 2
+MIN_SKILLS = 30
 
 
 def cv_to_id_text(cv: MasterCV) -> str:
@@ -189,8 +194,44 @@ def _validate_entries(allowed, raw_list, max_bullets, max_entries, kind, warning
     return out
 
 
-def _fallback_entries(entries, max_bullets, max_entries):
-    return [{"id": e.id, "bullets": [b.id for b in e.bullets][:max_bullets]} for e in entries[:max_entries]]
+def _top_up_entries(chosen, entries, max_bullets, max_entries):
+    """Add master entries the model did not choose, until the section has MIN_ENTRIES.
+
+    It tops up rather than replacing. The model's picks — and its bullet choices within
+    them — survive; only the padding comes from the master. Replacing outright meant that a
+    candidate with two jobs, whose model correctly picked the one relevant job, got no
+    tailoring of that section at all.
+    """
+    out = list(chosen)
+    taken = {item["id"] for item in out}
+    for entry in entries:
+        if len(out) >= MIN_ENTRIES or len(out) >= max_entries:
+            break
+        if entry.id in taken:
+            continue
+        out.append({"id": entry.id, "bullets": [b.id for b in entry.bullets][:max_bullets]})
+    return out
+
+
+def _top_up_skills(chosen: dict, master: dict) -> dict:
+    """Pad the skills list to MIN_SKILLS, keeping the model's picks first in each group.
+
+    A four-item skills list on a software CV is worse than no tailoring: it drops the
+    keywords automated screens look for, and it reads to a human as a broken generator.
+    """
+    out = {group: list(items) for group, items in chosen.items() if items}
+    total = sum(len(v) for v in out.values())
+    for group, options in master.items():
+        if total >= MIN_SKILLS:
+            break
+        kept = out.setdefault(group, [])
+        for skill in options:
+            if total >= MIN_SKILLS:
+                break
+            if skill not in kept:
+                kept.append(skill)
+                total += 1
+    return {group: items for group, items in out.items() if items}
 
 
 def validate_selection(cv: MasterCV, raw: dict, max_bullets: int = 4) -> tuple[dict, list[str]]:
@@ -208,13 +249,14 @@ def validate_selection(cv: MasterCV, raw: dict, max_bullets: int = 4) -> tuple[d
     proj = _validate_entries({p.id: p for p in cv.projects}, raw.get("projects"),
                              max_bullets, MAX_PROJECT_ENTRIES, "projects", warnings)
 
-    # Per-section fallback: a near-empty section is worse than the master's own order.
-    if len(exp) < 2 and len(cv.experience) > len(exp):
-        exp = _fallback_entries(cv.experience, max_bullets, MAX_EXPERIENCE_ENTRIES)
-        warnings.append("experience: fewer than two entries survived; fell back to the master order")
-    if len(proj) < 2 and len(cv.projects) > len(proj):
-        proj = _fallback_entries(cv.projects, max_bullets, MAX_PROJECT_ENTRIES)
-        warnings.append("projects: fewer than two entries survived; fell back to the master order")
+    # Per-section top-up: a near-empty section looks thin, but the model's picks are the
+    # tailoring, so they stay and the master only fills the gap.
+    if len(exp) < MIN_ENTRIES and len(cv.experience) > len(exp):
+        exp = _top_up_entries(exp, cv.experience, max_bullets, MAX_EXPERIENCE_ENTRIES)
+        warnings.append(f"experience: topped up to {len(exp)} entries from the master")
+    if len(proj) < MIN_ENTRIES and len(cv.projects) > len(proj):
+        proj = _top_up_entries(proj, cv.projects, max_bullets, MAX_PROJECT_ENTRIES)
+        warnings.append(f"projects: topped up to {len(proj)} entries from the master")
 
     skills: dict[str, list[str]] = {}
     for group, chosen in (raw.get("skills") or {}).items():
@@ -228,9 +270,11 @@ def validate_selection(cv: MasterCV, raw: dict, max_bullets: int = 4) -> tuple[d
                 warnings.append(f"skills: {s!r} is not in the master {group!r} list; dropped")
         if kept:
             skills[group] = kept
-    if not skills:
-        skills = {k: list(v) for k, v in cv.skills.items()}
-        if cv.skills:
-            warnings.append("skills: nothing usable selected; kept the master's skills")
+
+    selected_count = sum(len(v) for v in skills.values())
+    if selected_count < MIN_SKILLS and cv.skills:
+        skills = _top_up_skills(skills, cv.skills)
+        warnings.append(f"skills: {selected_count} selected; topped up to "
+                        f"{sum(len(v) for v in skills.values())} from the master")
 
     return {"experience": exp, "projects": proj, "skills": skills}, warnings
