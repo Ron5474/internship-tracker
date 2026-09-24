@@ -2,7 +2,7 @@ from pathlib import Path
 import hashlib
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from config import FEEDS
 
@@ -18,6 +18,11 @@ def webhook_key(url: str) -> str:
 
 
 class User(BaseModel):
+    # A typo'd or misspelled key (e.g. `discord_webhook_privat:`) must fail loudly at load time
+    # rather than being silently dropped by Pydantic's default extra="ignore" — which would leave
+    # discord_webhook_private unset and route CV-derived content to the public feed.
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     cv: str
     discord_webhook: str
@@ -25,7 +30,16 @@ class User(BaseModel):
     sections: list[str] = Field(min_length=1)
     threshold: int = 60
     notify_below_threshold: bool = False
-    discord_webhook_private: str | None = None
+    # min_length=1 so `discord_webhook_private: ""` fails validation instead of passing as a
+    # falsy-but-present string that `results_webhook` would then silently route to the public URL.
+    discord_webhook_private: str | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _private_differs_from_public(self) -> "User":
+        if self.discord_webhook_private is not None and self.discord_webhook_private == self.discord_webhook:
+            # Same channel would then get both the public feed post and the full scored message.
+            raise ValueError("discord_webhook_private must differ from discord_webhook")
+        return self
 
     @field_validator("feeds")
     @classmethod

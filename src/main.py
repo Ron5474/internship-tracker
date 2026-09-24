@@ -34,6 +34,19 @@ def load_cvs(users: list[User]) -> dict[str, dict]:
     return {u.id: load_cv(u.cv).model_dump() for u in users}
 
 
+def _log_results_routing(users: list[User]) -> None:
+    """Which webhook each user's scores, gaps and resumes are routed to.
+
+    Unconditional (not just when someone is split) and named both ways: a typo'd key, a null
+    value, or an empty string all leave `feed_webhook` falsy and previously printed nothing at
+    all at boot, indistinguishable from a quiet restart with no new postings.
+    """
+    private = [u.id for u in users if u.feed_webhook]
+    public = [u.id for u in users if not u.feed_webhook]
+    log.info("Results routing — private webhook: %s; single public webhook: %s",
+             ", ".join(private) or "none", ", ".join(public) or "none")
+
+
 def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] | None = None, tailor=None):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
@@ -89,9 +102,7 @@ def main() -> None:
     log.info("Tracker starting: %d users, feeds %s, interval %ds",
              len(users), list(FEEDS), settings.poll_interval)
 
-    split = [u.id for u in users if u.feed_webhook]
-    if split:
-        log.info("Public feed enabled for: %s (results go to their private webhooks)", ", ".join(split))
+    _log_results_routing(users)
 
     # Bring pre-pipeline state files to version 2 first (PR #1). Retry until GitHub answers.
     internships = FEEDS["internships"]

@@ -283,3 +283,18 @@ def test_ensure_columns_is_still_a_noop_on_a_current_database(tmp_path):
     engine = make_engine(str(tmp_path / "new.db"))
     init_db(engine)
     assert ensure_columns(engine) == []
+
+
+def test_init_db_recreates_a_missing_feed_posts_table(tmp_path):
+    # The no-op test above only covers a fresh database. The production path is an existing
+    # pre-Plan-5 tracker.db, which has every table except feed_posts, gaining it on boot via
+    # init_db()'s create_all() — ensure_columns() only adds columns to tables that already exist.
+    engine = make_engine(str(tmp_path / "old.db"))
+    init_db(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE feed_posts"))
+    assert "feed_posts" not in inspect(engine).get_table_names()
+
+    init_db(engine)
+
+    assert "feed_posts" in inspect(engine).get_table_names()

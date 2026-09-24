@@ -118,3 +118,24 @@ def test_webhook_key_is_stable_and_not_the_url():
 
 def test_webhook_key_separates_different_destinations():
     assert webhook_key("https://d/a") != webhook_key("https://d/b")
+
+
+def test_unknown_key_is_rejected_not_silently_dropped():
+    # A typo'd `discord_webhook_privat:` must fail loudly, not be ignored by
+    # Pydantic's default extra="ignore" and leave results routed to the public webhook.
+    bad = VALID.replace("  threshold: 60\n", "  threshold: 60\n  discord_webhook_privat: https://d/typo\n")
+    with pytest.raises(ValueError):
+        load_users(_write(bad))
+
+
+def test_empty_private_webhook_is_rejected():
+    # `discord_webhook_private: ""` must not validate as a falsy-but-present value that
+    # silently falls back to the public webhook via `results_webhook`.
+    with pytest.raises(ValueError):
+        _user(discord_webhook_private="")
+
+
+def test_private_webhook_same_as_public_is_rejected():
+    # Configured this way, one channel would get both the feed post and the full scored message.
+    with pytest.raises(ValueError):
+        _user(discord_webhook="https://d/shared", discord_webhook_private="https://d/shared")

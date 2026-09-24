@@ -107,6 +107,7 @@ class Worker:
         self._send = send
         self._fetch = fetch
         self._now = now
+        self._orphan_feed_warned = False   # log once per process, not on every idle tick
         self._fetch_not_before: datetime | None = None
         self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
         self._tailor_invalid_streak = 0   # own counter — never shared with score()'s _invalid_streak
@@ -160,6 +161,9 @@ class Worker:
         not the Plan 4 -> Plan 3 rollback path, which the runbook SQL in docs/ops.md covers
         instead (an older Plan 3 image has no tailor/render selectors at all to drain into).
         """
+        with self._sessions() as session:
+            self._warn_orphan_feed_posts(session)
+
         if self._tailoring_enabled:
             return
         with self._sessions() as session:
@@ -168,6 +172,28 @@ class Worker:
         if drained:
             log.warning("Tailoring not configured: %d queued row(s) will be delivered "
                         "with the score only", drained)
+
+    def _warn_orphan_feed_posts(self, session: Session) -> None:
+        """Unsent feed posts whose destination is no longer in users.yaml.
+
+        `_next_feed_post` filters `webhook_key.in_(self._feed_webhooks)` in SQL, so a row whose
+        destination fell out of the live config (discord_webhook repointed, or the user removed)
+        is invisible to the worker forever, with no log. It is also invisible to the runbook's
+        `attempts > 0` diagnostic, since these rows never get an attempt: attempts=0, error=NULL.
+        deliver() handles the exact analogue loudly for a missing user; this matches it, once per
+        process rather than on every idle tick.
+        """
+        if self._orphan_feed_warned:
+            return
+        self._orphan_feed_warned = True
+        keys = [key for (key,) in session.query(FeedPost.webhook_key)
+                .filter(FeedPost.sent_at.is_(None)).all()
+                if key not in self._feed_webhooks]
+        if not keys:
+            return
+        orphan_keys = sorted(set(keys))
+        log.warning("%d unsent feed post(s) target %d destination(s) no longer in users.yaml: %s",
+                    len(keys), len(orphan_keys), ", ".join(orphan_keys))
 
     def run_forever(self, idle_sleep: float = 3.0) -> None:
         self.startup()
@@ -255,7 +281,7 @@ class Worker:
             session.query(FeedPost)
             .filter(FeedPost.sent_at.is_(None),
                     FeedPost.next_attempt_at <= now,
-                    FeedPost.webhook_key.in_(self._feed_webhooks))
+                    FeedPost.webhook_key.in_(list(self._feed_webhooks)))
             .order_by(FeedPost.next_attempt_at, FeedPost.id)
             .all()
         )

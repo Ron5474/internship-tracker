@@ -370,6 +370,37 @@ def test_a_feed_post_for_an_unknown_destination_is_skipped(session_factory, sess
     assert sender.calls == []
 
 
+def test_orphan_feed_posts_are_warned_once_at_startup(session_factory, session, clock, caplog):
+    # A config change (discord_webhook repointed, or the user removed) strands these rows:
+    # SQL filters them out of _next_feed_post forever, and the runbook's `attempts > 0`
+    # diagnostic never sees them either (attempts=0, error=NULL). deliver() logs loudly the
+    # exact analogue (a missing user) — this must too, but only once, not on every idle tick.
+    for pseudo_user in ("feedjob1", "feedjob2"):   # two distinct rows, same orphan destination
+        ev = _seed(session, pseudo_user, stage=STAGE_CLOSED)
+        session.add(FeedPost(job=ev.job, webhook_key="deadbeefdeadbeef", next_attempt_at=T0))
+    session.commit()
+    w = _worker(session_factory, FakeSender(), clock, users=(RON_SPLIT,))
+    with caplog.at_level("WARNING"):
+        w.startup()
+    assert caplog.text.count("deadbeefdeadbeef") == 1  # named once, not once per row
+    assert "2" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        w.startup()
+        w.run_once()
+        w.run_once()
+    assert "deadbeefdeadbeef" not in caplog.text        # not logged again
+
+
+def test_no_orphan_warning_when_every_feed_post_has_a_live_destination(session_factory, session, clock, caplog):
+    _seed_feed_post(session)   # SHARED, a live destination for RON_SPLIT
+    w = _worker(session_factory, FakeSender(OK), clock, users=(RON_SPLIT,))
+    with caplog.at_level("WARNING"):
+        w.startup()
+    assert "orphan" not in caplog.text.lower() and "no longer" not in caplog.text.lower()
+
+
 def test_the_feed_never_blocks_on_the_private_channel(session_factory, session, clock):
     # A dead private webhook must not stop the public feed: they are different destinations.
     post = _seed_feed_post(session)

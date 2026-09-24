@@ -140,6 +140,25 @@ def test_failure_mid_poll_writes_nothing(db, monkeypatch):
     assert db.query(Feed).filter_by(name="internships").one().last_sha == "s1"
 
 
+def test_failure_mid_poll_writes_no_feed_posts_either(db, monkeypatch):
+    # The existing atomicity test above patches _evaluations_for, which runs *before*
+    # _feed_posts_for in poll_feed's loop, so it never reaches the feed-post write and proves
+    # nothing about it. This exercises that path directly, with a split user so a feed post
+    # would actually be produced if the failure didn't roll it back.
+    poll_feed(db, SPEC, [FEED_RON], *_github("s1", README_V1))
+    import poller as poller_mod
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(poller_mod, "_feed_posts_for", boom)
+    with pytest.raises(RuntimeError):
+        poll_feed(db, SPEC, [FEED_RON], *_github("s2", README_V2))
+    db.rollback()
+    assert db.query(FeedPost).count() == 0
+    assert db.query(Feed).filter_by(name="internships").one().last_sha == "s1"
+
+
 SHARED = "https://d/1"        # _user() already points every user at this webhook
 
 FEED_RON = RON.model_copy(update={"discord_webhook_private": "https://d/private"})

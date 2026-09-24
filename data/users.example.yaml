@@ -10,4 +10,7 @@
   # Optional. Set this and the split begins: `discord_webhook` above becomes a public,
   # link-only feed of every matching posting, and scores, gaps and tailored resumes go
   # here instead. Leave it out and everything goes to the one webhook, as before.
-  discord_webhook_private: https://discord.com/api/webhooks/YOUR_ID/YOUR_TOKEN
+  # Must be a *different* URL from discord_webhook above — commented out here because it
+  # would otherwise show the same YOUR_ID/YOUR_TOKEN placeholder as the public webhook, and
+  # filling in one placeholder for both would send everything to the same channel twice.
+  # discord_webhook_private: https://discord.com/api/webhooks/YOUR_OTHER_ID/YOUR_OTHER_TOKEN

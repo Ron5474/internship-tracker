@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -94,6 +95,32 @@ class _StopLoop(BaseException):
     Subclasses BaseException (not Exception) so it is NOT swallowed by the
     `except Exception` guard inside _poll_loop that this test is verifying.
     """
+
+
+# --- startup log: which webhook each user's results go to -----------------
+
+def test_results_routing_logged_both_ways(caplog):
+    # Whichever way it's configured, the split's state must be visible at boot.
+    split_user = RON.model_copy(update={"discord_webhook_private": "https://d/private"})
+    plain_user = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"), discord_webhook="https://d/cousin",
+                      feeds=["internships"], sections=["software engineering"])
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([split_user, plain_user])
+    assert "ron" in caplog.text
+    assert "cousin" in caplog.text
+    assert "private" in caplog.text
+    assert "public" in caplog.text
+
+
+def test_results_routing_logged_even_when_nobody_is_split(caplog):
+    # Previously this printed nothing at all — indistinguishable from a normal, quiet boot —
+    # for a typo'd key, a null value, or an empty string, all of which leave feed_webhook falsy.
+    plain_user = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"), discord_webhook="https://d/cousin",
+                      feeds=["internships"], sections=["software engineering"])
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([plain_user])
+    assert "cousin" in caplog.text
+    assert caplog.records
 
 
 def test_poll_loop_survives_exception_and_continues(monkeypatch):
