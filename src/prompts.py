@@ -77,8 +77,11 @@ How to choose:
   relevant first. The first ones you list are the ones that make the page.
 - Inside each entry, list only the bullet IDs worth keeping, most relevant first.
 - A bullet ID must be listed under the entry it belongs to. Bullet IDs start with their entry's ID.
-- Skills: keep only the skills this posting cares about, under the same group names the CV uses.
-  Do not add a skill the CV does not list.
+- Skills: keep every skill that is plausibly relevant, under the same group names the CV uses,
+  most relevant first. Aim for 15-25. They cost about one line per ten, and a four-item skills
+  list reads as a mistake rather than as focus. Do not add a skill the CV does not list.
+- Include every experience entry unless it is clearly irrelevant to this posting. A resume
+  showing one job looks thin, and the candidate may only have two.
 - Education and the summary are always on the resume. Do not select them.
 
 Reply with ONLY a JSON object, no prose, no code fences:

@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cv import MAX_EXPERIENCE_ENTRIES, MAX_PROJECT_ENTRIES, MasterCV, all_ids, cv_to_id_text, cv_to_text, load_cv, validate_selection
+from cv import MAX_EXPERIENCE_ENTRIES, MAX_PROJECT_ENTRIES, MIN_ENTRIES, MasterCV, all_ids, cv_to_id_text, cv_to_text, load_cv, validate_selection
 
 FIXTURE = str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")
 
@@ -178,15 +178,18 @@ def test_foreign_skill_dropped_and_group_subset_enforced():
         "experience": [], "projects": [],
         "skills": {group: [real, "COBOL-on-Mars"], "invented_group": ["x"]},
     })
-    assert sel["skills"] == {group: [real]}
+    assert sel["skills"][group][0] == real          # the model's pick leads its group
+    assert "COBOL-on-Mars" not in sel["skills"][group]
+    assert "invented_group" not in sel["skills"]
     assert any("COBOL-on-Mars" in w for w in warnings)
     assert any("invented_group" in w for w in warnings)
 
 
-def test_too_few_experience_entries_falls_back_to_master_order():
+def test_an_empty_section_is_topped_up_from_the_master():
     cv = _cv()
     sel, warnings = validate_selection(cv, {"experience": [], "projects": [], "skills": {}}, max_bullets=2)
-    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MAX_EXPERIENCE_ENTRIES]
+    # Topped up to the floor, not to the cap: padding is a safety net, not a target.
+    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MIN_ENTRIES]
     assert sel["experience"][0]["bullets"] == [b.id for b in cv.experience[0].bullets][:2]
     assert any("experience" in w for w in warnings)
 
@@ -212,14 +215,55 @@ def test_duplicate_ids_are_collapsed():
     assert any("duplicate" in w for w in warnings)
 
 
-def test_a_single_surviving_entry_triggers_the_fallback():
-    # The other side of the coin the tests above avoid: one entry is not a resume section.
+def test_topping_up_keeps_the_models_own_pick_and_its_bullets():
+    # The defect this replaces: a candidate with two jobs, whose model correctly picked the one
+    # relevant job, had that choice thrown away and the whole section rebuilt from the master.
     cv = _cv()
-    a = cv.experience[0]
-    sel, warnings = validate_selection(cv, {"experience": [{"id": a.id, "bullets": [a.bullets[0].id]}],
-                                            "projects": [], "skills": {}}, max_bullets=2)
-    assert [e["id"] for e in sel["experience"]] == [e.id for e in cv.experience][:MAX_EXPERIENCE_ENTRIES]
-    assert any("fell back" in w for w in warnings)
+    chosen = cv.experience[1]                       # deliberately NOT the master's first
+    bullet = chosen.bullets[-1].id                  # deliberately NOT the master's first bullet
+    sel, warnings = validate_selection(
+        cv, {"experience": [{"id": chosen.id, "bullets": [bullet]}], "projects": [], "skills": {}},
+        max_bullets=2)
+
+    assert sel["experience"][0]["id"] == chosen.id          # the model still leads
+    assert sel["experience"][0]["bullets"] == [bullet]      # with the bullet it chose
+    assert len(sel["experience"]) == MIN_ENTRIES            # padded only to the floor
+    assert chosen.id not in [e["id"] for e in sel["experience"][1:]]   # no duplicate
+    assert any("topped up" in w for w in warnings)
+
+
+def test_topping_up_never_exceeds_the_entry_cap():
+    cv = _cv()
+    sel, _ = validate_selection(cv, {"experience": [], "projects": [], "skills": {}})
+    assert len(sel["projects"]) <= MAX_PROJECT_ENTRIES
+
+
+def test_skills_below_the_floor_are_topped_up_with_the_models_picks_first():
+    cv = _cv()
+    group = list(cv.skills)[-1]
+    pick = cv.skills[group][-1]
+    sel, warnings = validate_selection(cv, {"experience": [], "projects": [],
+                                            "skills": {group: [pick]}})
+    assert sel["skills"][group][0] == pick
+    # The fixture has fewer skills than the floor, so everything it has should now be present.
+    assert sum(len(v) for v in sel["skills"].values()) == sum(len(v) for v in cv.skills.values())
+    assert any("topped up" in w for w in warnings)
+
+
+def test_top_up_skills_stops_at_the_floor():
+    from cv import MIN_SKILLS, _top_up_skills
+    master = {"languages": [f"L{i}" for i in range(40)]}
+    out = _top_up_skills({"languages": ["L39"]}, master)
+    assert len(out["languages"]) == MIN_SKILLS
+    assert out["languages"][0] == "L39"                      # the pick still leads
+    assert "L39" not in out["languages"][1:]                 # and is not duplicated
+
+
+def test_top_up_skills_leaves_a_full_selection_alone():
+    from cv import MIN_SKILLS, _top_up_skills
+    chosen = {"languages": [f"L{i}" for i in range(MIN_SKILLS + 5)]}
+    master = {"languages": [f"L{i}" for i in range(60)]}
+    assert _top_up_skills(chosen, master) == chosen
 
 
 def test_selection_is_json_round_trippable():
