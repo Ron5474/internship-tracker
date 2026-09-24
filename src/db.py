@@ -84,6 +84,28 @@ class Job(Base):
     evaluations: Mapped[list["Evaluation"]] = relationship(back_populates="job")
 
 
+class FeedPost(Base):
+    """One announcement of one job to one destination channel.
+
+    Keyed on the destination rather than on a user, so several users sharing a channel
+    produce a single post. `webhook_key` is a hash, never the URL itself.
+    """
+
+    __tablename__ = "feed_posts"
+    __table_args__ = (UniqueConstraint("job_id", "webhook_key", name="uq_feed_post_job_webhook"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("jobs.id"))
+    webhook_key: Mapped[str] = mapped_column(String)
+
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    job: Mapped[Job] = relationship()
+
+
 class Evaluation(Base):
     __tablename__ = "evaluations"
     __table_args__ = (UniqueConstraint("job_id", "user_id", name="uq_eval_job_user"),)
