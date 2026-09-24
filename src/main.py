@@ -19,6 +19,13 @@ from worker import Worker
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+# Rendering one resume emits ~100 INFO lines of per-glyph subsetting detail, which buries the
+# pipeline's own lines and makes `docker compose logs` useless for spotting real problems.
+# Their warnings still come through.
+for _noisy in ("weasyprint", "weasyprint.progress", "fontTools", "fontTools.subset"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 log = logging.getLogger("main")
 
 
