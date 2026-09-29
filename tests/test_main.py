@@ -411,3 +411,25 @@ def test_a_posting_reaches_the_feed_and_the_match_reaches_the_private_channel(tm
     private = by_webhook["https://d/private"]
     assert len(private) == 1 and private[0][0].startswith("🎯")
     assert private[0][1] is not None                  # the PDF went here
+
+
+def test_a_feeds_only_user_is_reported_as_public(caplog):
+    """Public feed channels do not make a user's own results private.
+
+    Someone who sets `discord_webhook_feeds` but no `discord_webhook_private` has public
+    channels for postings while their scores, gaps and resumes still arrive on
+    `discord_webhook`. Reporting them as private would be a false all-clear about exactly
+    the exposure this line exists to make visible.
+    """
+    feeds_only = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"),
+                      discord_webhook="https://d/cousin",
+                      discord_webhook_feeds={"internships": "https://d/interns"},
+                      feeds=["internships"], sections=["software engineering"])
+    assert feeds_only.feed_webhooks()                        # it does have a public feed
+    assert feeds_only.results_webhook == "https://d/cousin"  # and its results are still public
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([feeds_only])
+    private_part, public_part = caplog.text.split("single public webhook:")
+    assert "cousin" not in private_part
+    assert "cousin" in public_part

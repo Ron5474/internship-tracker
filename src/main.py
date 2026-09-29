@@ -38,11 +38,16 @@ def _log_results_routing(users: list[User]) -> None:
     """Which webhook each user's scores, gaps and resumes are routed to.
 
     Unconditional (not just when someone is split) and named both ways: a typo'd key, a null
-    value, or an empty string all leave `feed_webhook` falsy and previously printed nothing at
-    all at boot, indistinguishable from a quiet restart with no new postings.
+    value, or an empty string all leave the private webhook unset and previously printed nothing
+    at all at boot, indistinguishable from a quiet restart with no new postings.
+
+    The test is where results actually go, not whether the user has a public feed. Someone who
+    configures `discord_webhook_feeds` without `discord_webhook_private` has public channels but
+    still receives their own scores and resumes on `discord_webhook` — reporting them as private
+    would be a false all-clear about the one thing this line exists to confirm.
     """
-    private = [u.id for u in users if u.feed_webhooks()]
-    public = [u.id for u in users if not u.feed_webhooks()]
+    private = [u.id for u in users if u.results_webhook != u.discord_webhook]
+    public = [u.id for u in users if u.results_webhook == u.discord_webhook]
     log.info("Results routing — private webhook: %s; single public webhook: %s",
              ", ".join(private) or "none", ", ".join(public) or "none")
 
