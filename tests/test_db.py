@@ -17,6 +17,7 @@ from db import (
     STAGE_TAILOR,
     Evaluation,
     Feed,
+    FeedPost,
     Job,
     drain_resume_stages,
     ensure_columns,
@@ -246,3 +247,54 @@ def test_drain_resume_stages_moves_queued_rows_to_deliver(session_factory, sessi
     session.commit()
     assert a.stage == b.stage == STAGE_DELIVER and c.stage == STAGE_SCORE
     assert "not configured" in a.resume_error and a.pdf_path is None
+
+
+def test_feed_post_is_unique_per_job_and_destination(session_factory, session):
+    # The whole point: two users watching one shared channel must produce ONE post.
+    feed = Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed)
+    session.add_all([feed, job, FeedPost(job=job, webhook_key="abc")])
+    session.commit()
+    session.add(FeedPost(job=job, webhook_key="abc"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+    session.rollback()
+
+
+def test_two_destinations_each_get_their_own_row(session_factory, session):
+    feed = Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed)
+    session.add_all([feed, job, FeedPost(job=job, webhook_key="aaa"), FeedPost(job=job, webhook_key="bbb")])
+    session.commit()
+    assert session.query(FeedPost).count() == 2
+
+
+def test_feed_post_defaults_are_unsent(session_factory, session):
+    feed = Feed(name="internships", repo="a/b", branch="dev")
+    job = _job(feed)
+    post = FeedPost(job=job, webhook_key="abc")
+    session.add_all([feed, job, post])
+    session.commit()
+    assert post.sent_at is None and post.attempts == 0 and post.error is None
+    assert post.next_attempt_at is not None
+
+
+def test_ensure_columns_is_still_a_noop_on_a_current_database(tmp_path):
+    engine = make_engine(str(tmp_path / "new.db"))
+    init_db(engine)
+    assert ensure_columns(engine) == []
+
+
+def test_init_db_recreates_a_missing_feed_posts_table(tmp_path):
+    # The no-op test above only covers a fresh database. The production path is an existing
+    # pre-Plan-5 tracker.db, which has every table except feed_posts, gaining it on boot via
+    # init_db()'s create_all() — ensure_columns() only adds columns to tables that already exist.
+    engine = make_engine(str(tmp_path / "old.db"))
+    init_db(engine)
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE feed_posts"))
+    assert "feed_posts" not in inspect(engine).get_table_names()
+
+    init_db(engine)
+
+    assert "feed_posts" in inspect(engine).get_table_names()

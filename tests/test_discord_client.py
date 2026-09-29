@@ -121,6 +121,24 @@ def test_send_connection_error_is_transient():
     assert "down" in result.error
 
 
+def test_transient_error_redacts_the_webhook_url_and_token():
+    # requests wraps urllib3's text, which embeds the request path — including the token —
+    # for a ConnectionError/SSLError. That string is stored verbatim in the database and logged,
+    # so the token must never survive into DeliveryResult.error.
+    url = "https://discord.com/api/webhooks/123456/super-secret-token"
+    msg = ("HTTPSConnectionPool(host='discord.com', port=443): Max retries exceeded with "
+           "url: /api/webhooks/123456/super-secret-token?wait=true "
+           "(Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object>: "
+           "Failed to establish a new connection: [Errno -2] Name or service not known'))")
+    with patch("discord_client.requests.post", side_effect=requests.ConnectionError(msg)):
+        result = send_message(url, "hi")
+    assert result.kind == "transient"
+    assert "super-secret-token" not in result.error
+    assert "123456" not in result.error
+    assert "<webhook>" in result.error
+    assert "Max retries exceeded" in result.error   # still recognisable as a connection failure
+
+
 def test_send_404_is_gone():
     with patch("discord_client.requests.post", return_value=_resp(404)):
         assert send_message(WEBHOOK, "hi").kind == "gone"

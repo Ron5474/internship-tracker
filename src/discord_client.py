@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -94,6 +95,21 @@ def cap_content(header: str, lists: list[str], tail: str = "", body: str = "") -
     return "\n".join(p for p in (header, kept_body, *kept_lists, tail) if p)
 
 
+def _redact(message: str, webhook_url: str) -> str:
+    """Strip the webhook URL — and its credential-bearing path alone — out of an exception string.
+
+    For a ConnectionError/SSLError, requests wraps urllib3's text, which embeds only the request
+    *path* (e.g. "Max retries exceeded with url: /api/webhooks/<id>/<TOKEN>?wait=true"), not the
+    full URL with scheme and host. Storing that verbatim in the database or the logs leaks a live
+    credential, so both the full URL and its path are redacted before the error is ever returned.
+    """
+    redacted = message.replace(webhook_url, "<webhook>")
+    path = urlparse(webhook_url).path
+    if path and path in redacted:
+        redacted = redacted.replace(path, "<webhook>")
+    return redacted
+
+
 def send_message(webhook_url: str, content: str, pdf_path: str | None = None,
                  filename: str | None = None) -> DeliveryResult:
     """POST to a Discord webhook with ?wait=true. Success is 200 with a message body only.
@@ -121,7 +137,7 @@ def send_message(webhook_url: str, content: str, pdf_path: str | None = None,
         else:
             resp = requests.post(webhook_url, params={"wait": "true"}, json={"content": content}, timeout=10)
     except requests.RequestException as e:
-        return DeliveryResult("transient", None, str(e))
+        return DeliveryResult("transient", None, _redact(str(e), webhook_url))
 
     status = resp.status_code
     if status == 200:

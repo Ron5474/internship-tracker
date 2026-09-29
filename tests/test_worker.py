@@ -4,13 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, Job
+from db import FETCH_FAILED, FETCH_OK, FETCH_PENDING, STAGE_CLOSED, STAGE_DELIVER, Evaluation, Feed, FeedPost, Job
 from discord_client import DeliveryResult
 from fetcher import FetchResult
-from users import User
+from users import User, webhook_key
 from worker import (
     BACKOFF_SECONDS,
     DELIVERY_BUDGET,
+    FEED_BUDGET,
     FETCH_BUDGET,
     FETCH_GAP_SECONDS,
     FETCH_MAX_AGE_HOURS,
@@ -24,6 +25,11 @@ T0 = datetime(2026, 9, 19, 12, 0, 0)
 RON = User(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"], sections=["software"])
 COUSIN = User(id="cousin", cv="/x", discord_webhook="https://d/cousin", feeds=["internships"], sections=["software"])
 DANA = User(id="dana", cv="/x", discord_webhook="https://d/dana", feeds=["internships"], sections=["software"])
+
+SHARED = "https://d/shared"
+RON_SPLIT = User(id="ron", cv="/x", discord_webhook=SHARED,
+                 discord_webhook_private="https://d/private",
+                 feeds=["internships"], sections=["software"])
 
 
 class FakeSender:
@@ -293,6 +299,155 @@ def test_restart_resumes_pending_delivery(session_factory, session, clock):
     assert w2.run_once() is True
     session.refresh(ev)
     assert ev.stage == STAGE_CLOSED
+
+
+# --- feed -------------------------------------------------------------------
+
+def _seed_feed_post(session, key=None):
+    # A dedicated pseudo-user id, so the job this creates (keyed on user_id — see _seed) never
+    # collides with a "ron"/"cousin"/"dana" job a test seeds alongside it.
+    ev = _seed(session, "feedjob", stage=STAGE_CLOSED)   # a job exists; the evaluation is irrelevant
+    post = FeedPost(job=ev.job, webhook_key=key or webhook_key(SHARED), next_attempt_at=T0)
+    session.add(post)
+    session.commit()
+    return post
+
+
+def test_a_feed_post_sends_the_link_only_message_to_the_shared_channel(session_factory, session, clock):
+    post = _seed_feed_post(session)
+    sender = FakeSender(OK)
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    assert w.run_once() is True
+    webhook, content, pdf, filename = sender.calls[0]
+    assert webhook == SHARED                     # the public feed, not the private channel
+    assert content.startswith("🆕")
+    assert pdf is None                           # never a resume in the shared channel
+    assert "%" not in content                    # and never a score
+    session.refresh(post)
+    assert post.sent_at is not None
+
+
+def test_a_sent_feed_post_is_never_sent_again(session_factory, session, clock):
+    _seed_feed_post(session)
+    sender = FakeSender(OK)
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    assert w.run_once() is True
+    assert w.run_once() is False
+    assert len(sender.calls) == 1
+
+
+def test_a_feed_post_retries_with_backoff(session_factory, session, clock):
+    post = _seed_feed_post(session)
+    sender = FakeSender(DeliveryResult("transient", None, "503"), OK)
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    w.run_once()
+    session.refresh(post)
+    assert post.sent_at is None and post.attempts == 1 and "503" in post.error
+    assert post.next_attempt_at == T0 + timedelta(seconds=BACKOFF_SECONDS[0])
+    clock.advance(BACKOFF_SECONDS[0])
+    w.run_once()
+    session.refresh(post)
+    assert post.sent_at is not None
+
+
+def test_a_gone_feed_webhook_pauses_that_destination_until_restart(session_factory, session, clock):
+    key = webhook_key(SHARED)
+    _seed_feed_post(session)
+    sender = FakeSender(DeliveryResult("gone", None, "webhook returned 404"))
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    w.run_once()
+    assert w.is_paused(f"feed:{key}") is True
+    clock.advance(86400)
+    assert w.run_once() is False                 # still paused a day later
+
+
+def test_a_feed_post_for_an_unknown_destination_is_skipped(session_factory, session, clock):
+    # Its user left users.yaml. Nothing can send it; it must not block the loop either.
+    _seed_feed_post(session, key="deadbeefdeadbeef")
+    sender = FakeSender()
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    assert w.run_once() is False
+    assert sender.calls == []
+
+
+def test_orphan_feed_posts_are_warned_once_at_startup(session_factory, session, clock, caplog):
+    # A config change (discord_webhook repointed, or the user removed) strands these rows:
+    # SQL filters them out of _next_feed_post forever, and the runbook's `attempts > 0`
+    # diagnostic never sees them either (attempts=0, error=NULL). deliver() logs loudly the
+    # exact analogue (a missing user) — this must too, but only once, not on every idle tick.
+    for pseudo_user in ("feedjob1", "feedjob2"):   # two distinct rows, same orphan destination
+        ev = _seed(session, pseudo_user, stage=STAGE_CLOSED)
+        session.add(FeedPost(job=ev.job, webhook_key="deadbeefdeadbeef", next_attempt_at=T0))
+    session.commit()
+    w = _worker(session_factory, FakeSender(), clock, users=(RON_SPLIT,))
+    with caplog.at_level("WARNING"):
+        w.startup()
+    assert caplog.text.count("deadbeefdeadbeef") == 1  # named once, not once per row
+    assert "2" in caplog.text
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        w.startup()
+        w.run_once()
+        w.run_once()
+    assert "deadbeefdeadbeef" not in caplog.text        # not logged again
+
+
+def test_no_orphan_warning_when_every_feed_post_has_a_live_destination(session_factory, session, clock, caplog):
+    _seed_feed_post(session)   # SHARED, a live destination for RON_SPLIT
+    w = _worker(session_factory, FakeSender(OK), clock, users=(RON_SPLIT,))
+    with caplog.at_level("WARNING"):
+        w.startup()
+    assert "orphan" not in caplog.text.lower() and "no longer" not in caplog.text.lower()
+
+
+def test_the_feed_never_blocks_on_the_private_channel(session_factory, session, clock):
+    # A dead private webhook must not stop the public feed: they are different destinations.
+    post = _seed_feed_post(session)
+    sender = FakeSender(OK)
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    w._pause("discord:ron", None, "private webhook gone")
+    assert w.run_once() is True
+    session.refresh(post)
+    assert post.sent_at is not None
+
+
+def test_results_go_to_the_private_webhook(session_factory, session, clock):
+    ev = _resolve(session, _seed(session, "ron", stage=STAGE_DELIVER, score=82,
+                                 outcome="matched", reasoning="why"))
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock, users=(RON_SPLIT,)).run_once()
+    assert sender.calls[0][0] == "https://d/private"
+    assert sender.calls[0][1].startswith("🎯")
+
+
+def test_results_stay_on_the_single_webhook_when_no_private_one_is_set(session_factory, session, clock):
+    # Plan 1-4 behaviour, unchanged for a user who has not opted in.
+    ev = _resolve(session, _seed(session, "ron", stage=STAGE_DELIVER, score=82,
+                                 outcome="matched", reasoning="why"))
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock).run_once()          # RON has no private webhook
+    assert sender.calls[0][0] == RON.discord_webhook
+
+
+def test_a_ready_result_is_delivered_before_a_feed_post(session_factory, session, clock):
+    _seed_feed_post(session)
+    ev = _resolve(session, _seed(session, "ron", stage=STAGE_DELIVER, score=82, outcome="matched"))
+    sender = FakeSender(OK, OK)
+    w = _worker(session_factory, sender, clock, users=(RON_SPLIT,))
+    w.run_once()
+    assert sender.calls[0][1].startswith("🎯")
+
+
+def test_feed_over_budget_logs_but_keeps_trying(session_factory, session, clock):
+    # A feed post is a notification: like delivery, it has no give-up.
+    post = _seed_feed_post(session)
+    post.attempts = FEED_BUDGET + 1
+    session.commit()
+    sender = FakeSender(OK)
+    _worker(session_factory, sender, clock, users=(RON_SPLIT,)).run_once()
+    session.refresh(post)
+    assert post.sent_at is not None
 
 
 # --- fetch -----------------------------------------------------------------
@@ -1496,3 +1651,23 @@ def test_delivery_falls_back_to_the_file_name_without_a_snapshot(session_factory
     sender = FakeSender(OK)
     _worker(session_factory, sender, clock).run_once()
     assert sender.calls[0][3] is None
+
+
+def test_two_channels_resolve_to_their_own_webhooks(session_factory, session, clock):
+    """One key per channel, each resolving to its own URL — the map is what routing rests on."""
+    interns, fulltime = "https://d/interns", "https://d/fulltime"
+    user = RON_SPLIT.model_copy(update={
+        "feeds": ["internships", "new-grad"],
+        "discord_webhook_feeds": {"internships": interns, "new-grad": fulltime},
+    })
+    post = _seed_feed_post(session, key=webhook_key(interns))
+    other = FeedPost(job=post.job, webhook_key=webhook_key(fulltime), next_attempt_at=T0)
+    session.add(other)
+    session.commit()
+
+    sender = FakeSender(OK, OK)
+    w = _worker(session_factory, sender, clock, users=(user,))
+    assert w.run_once() is True
+    assert w.run_once() is True
+    assert w.run_once() is False
+    assert sorted(call[0] for call in sender.calls) == sorted([interns, fulltime])

@@ -217,3 +217,49 @@ UPDATE evaluations SET stage='render', attempts=0, pdf_path=NULL, page_overflow=
 ```
 
 8. **Re-scoring a row (after a CV or rubric change) must clear every downstream artifact**, not just `stage='score'` — see "Calibration week" above for why and the exact statement.
+
+## Split destinations
+
+Set `discord_webhook_private` for a user and their `discord_webhook` splits in two:
+
+- **`discord_webhook`** becomes a public, link-only feed. Every matching posting gets one 🆕 announcement here — company, role, location, link. No score, no reasoning, no resume, ever.
+- **`discord_webhook_private`** gets everything derived from the candidate's CV: 🎯/📉 scores, reasoning, missing qualifications, and the tailored resume PDF for a match.
+
+Leave `discord_webhook_private` unset and nothing changes: the user's single `discord_webhook` keeps receiving everything, exactly as before the split existed. **The split is opt-in per user** — one user turning it on does not change where any *other* user's results go, including someone else sharing the same public webhook. It does, however, change what that shared channel receives: before the split it only ever saw above-threshold matches (someone else's, since this user's own results now go elsewhere); after, it also gets a 🆕 post for *every* posting matching this user's feeds and sections, regardless of score. For a shared channel with several users split, that is a real volume increase for everyone reading it, not just the user who opted in.
+
+**Enabling it never backfills.** Feed posts are created only for postings discovered by a poll *after* `discord_webhook_private` is set and the worker restarted; nothing already in the database is announced retroactively. A user switching on the split does not dump their history into a channel other people are reading.
+
+Restarting flips **results** routing to the private webhook immediately — including for evaluations already mid-pipeline (queued for scoring, tailoring or rendering when the process restarts), since `results_webhook` is read fresh at delivery time. Only the **feed** waits for the next poll cycle, since feed posts are created by the poller, not retroactively for jobs already in the database.
+
+**Rolling back.** A pre-Plan-5 image ignores `discord_webhook_private` entirely and routes everything — scores, gaps, resumes — to `discord_webhook`. Before rolling back to an older image, repoint `discord_webhook` to the private URL in `users.yaml`, or the rollback will silently send every score and resume to the public channel.
+
+`feed_posts` is keyed on `(job_id, webhook_key)`, not on the user — `webhook_key` is a hash of the destination URL (see `users.webhook_key`). If several users point `discord_webhook` at the same channel, that channel gets one 🆕 post per job, not one per user.
+
+### A channel per feed
+
+`discord_webhook_feeds` maps a feed to its own public channel, so internships and full-time roles land in different places:
+
+```yaml
+  discord_webhook_feeds:
+    internships: https://discord.com/api/webhooks/.../...
+    new-grad: https://discord.com/api/webhooks/.../...
+```
+
+A feed named here is announced there. A feed left out falls back to `discord_webhook`, so partial configuration is fine — route full-time somewhere new and leave internships where they are.
+
+Naming a channel for a feed is itself enough to start announcing it, with or without `discord_webhook_private`: results go to `results_webhook` either way, so a named feed channel can never receive them. Every URL in the mapping must differ from wherever results go, and loading `users.yaml` fails if it does not — otherwise one channel would get the 🆕 posting *and* the 🎯 scored message with the resume attached.
+
+The routing decision is made when the poller creates a `feed_posts` row, so changing the mapping affects postings discovered afterwards. Rows already queued under the old destination still go to the old channel; see the orphan warning below if you remove a channel rather than repointing it.
+
+```sql
+-- feed posts waiting to go out
+SELECT COUNT(*) FROM feed_posts WHERE sent_at IS NULL;
+
+-- feed posts that keep failing
+SELECT id, job_id, attempts, substr(error,1,60) FROM feed_posts
+WHERE sent_at IS NULL AND attempts > 0 ORDER BY attempts DESC;
+
+-- re-send one announcement
+UPDATE feed_posts SET sent_at=NULL, attempts=0, error=NULL,
+       next_attempt_at=CURRENT_TIMESTAMP WHERE id = <id>;
+```

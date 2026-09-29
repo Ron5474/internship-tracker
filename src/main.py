@@ -34,6 +34,24 @@ def load_cvs(users: list[User]) -> dict[str, dict]:
     return {u.id: load_cv(u.cv).model_dump() for u in users}
 
 
+def _log_results_routing(users: list[User]) -> None:
+    """Which webhook each user's scores, gaps and resumes are routed to.
+
+    Unconditional (not just when someone is split) and named both ways: a typo'd key, a null
+    value, or an empty string all leave the private webhook unset and previously printed nothing
+    at all at boot, indistinguishable from a quiet restart with no new postings.
+
+    The test is where results actually go, not whether the user has a public feed. Someone who
+    configures `discord_webhook_feeds` without `discord_webhook_private` has public channels but
+    still receives their own scores and resumes on `discord_webhook` — reporting them as private
+    would be a false all-clear about the one thing this line exists to confirm.
+    """
+    private = [u.id for u in users if u.results_webhook != u.discord_webhook]
+    public = [u.id for u in users if u.results_webhook == u.discord_webhook]
+    log.info("Results routing — private webhook: %s; single public webhook: %s",
+             ", ".join(private) or "none", ", ".join(public) or "none")
+
+
 def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] | None = None, tailor=None):
     engine = make_engine(os.path.join(settings.data_dir, "tracker.db"))
     init_db(engine)
@@ -88,6 +106,8 @@ def main() -> None:
     cvs = load_cvs(users)   # before the migration loop below, which retries GitHub forever
     log.info("Tracker starting: %d users, feeds %s, interval %ds",
              len(users), list(FEEDS), settings.poll_interval)
+
+    _log_results_routing(users)
 
     # Bring pre-pipeline state files to version 2 first (PR #1). Retry until GitHub answers.
     internships = FEEDS["internships"]

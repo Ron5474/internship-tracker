@@ -1,4 +1,5 @@
 import json
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -94,6 +95,32 @@ class _StopLoop(BaseException):
     Subclasses BaseException (not Exception) so it is NOT swallowed by the
     `except Exception` guard inside _poll_loop that this test is verifying.
     """
+
+
+# --- startup log: which webhook each user's results go to -----------------
+
+def test_results_routing_logged_both_ways(caplog):
+    # Whichever way it's configured, the split's state must be visible at boot.
+    split_user = RON.model_copy(update={"discord_webhook_private": "https://d/private"})
+    plain_user = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"), discord_webhook="https://d/cousin",
+                      feeds=["internships"], sections=["software engineering"])
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([split_user, plain_user])
+    assert "ron" in caplog.text
+    assert "cousin" in caplog.text
+    assert "private" in caplog.text
+    assert "public" in caplog.text
+
+
+def test_results_routing_logged_even_when_nobody_is_split(caplog):
+    # Previously this printed nothing at all — indistinguishable from a normal, quiet boot —
+    # for a typo'd key, a null value, or an empty string, all of which leave feed_webhook falsy.
+    plain_user = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"), discord_webhook="https://d/cousin",
+                      feeds=["internships"], sections=["software engineering"])
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([plain_user])
+    assert "cousin" in caplog.text
+    assert caplog.records
 
 
 def test_poll_loop_survives_exception_and_continues(monkeypatch):
@@ -351,3 +378,58 @@ def test_build_constructs_both_clients_with_their_own_models(tmp_path, monkeypat
     assert worker._tailor.model == "pro"
     assert worker._max_bullets == 3
     assert worker._output_dir == str(tmp_path / "output")
+
+
+def test_a_posting_reaches_the_feed_and_the_match_reaches_the_private_channel(tmp_path, session_factory, monkeypatch):
+    """The whole point of this plan, proved once end to end."""
+    users = [RON.model_copy(update={"discord_webhook_private": "https://d/private"})]
+    _poll_one_posting(session_factory, users, monkeypatch)
+    with session_factory() as session:
+        job = session.query(Job).one()
+        job.description, job.fetch_status = "We need a Python engineer.", FETCH_OK
+        session.commit()
+
+    worker, llm, tailor, sender = _pipeline(tmp_path, session_factory, users, {"ron": CV_SNAPSHOT})
+
+    # Bounded drain: run_once() until it reports nothing left, capped so a future regression
+    # that stops the queue from ever draining fails the test instead of hanging the suite.
+    for _ in range(20):
+        if not worker.run_once():
+            break
+    else:
+        pytest.fail("worker did not drain within 20 iterations")
+    assert worker.run_once() is False   # confirm the queue actually drained
+
+    by_webhook = {}
+    for webhook, content, pdf, _name in sender.calls:
+        by_webhook.setdefault(webhook, []).append((content, pdf))
+
+    feed = by_webhook[users[0].discord_webhook]
+    assert len(feed) == 1 and feed[0][0].startswith("🆕") and feed[0][1] is None
+    assert "%" not in feed[0][0]                      # no score ever reaches the shared channel
+
+    private = by_webhook["https://d/private"]
+    assert len(private) == 1 and private[0][0].startswith("🎯")
+    assert private[0][1] is not None                  # the PDF went here
+
+
+def test_a_feeds_only_user_is_reported_as_public(caplog):
+    """Public feed channels do not make a user's own results private.
+
+    Someone who sets `discord_webhook_feeds` but no `discord_webhook_private` has public
+    channels for postings while their scores, gaps and resumes still arrive on
+    `discord_webhook`. Reporting them as private would be a false all-clear about exactly
+    the exposure this line exists to make visible.
+    """
+    feeds_only = User(id="cousin", cv=str(FIXTURES / "cv_sample.yaml"),
+                      discord_webhook="https://d/cousin",
+                      discord_webhook_feeds={"internships": "https://d/interns"},
+                      feeds=["internships"], sections=["software engineering"])
+    assert feeds_only.feed_webhooks()                        # it does have a public feed
+    assert feeds_only.results_webhook == "https://d/cousin"  # and its results are still public
+
+    with caplog.at_level(logging.INFO, logger="main"):
+        main._log_results_routing([feeds_only])
+    private_part, public_part = caplog.text.split("single public webhook:")
+    assert "cousin" not in private_part
+    assert "cousin" in public_part
