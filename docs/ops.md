@@ -235,6 +235,22 @@ Restarting flips **results** routing to the private webhook immediately — incl
 
 `feed_posts` is keyed on `(job_id, webhook_key)`, not on the user — `webhook_key` is a hash of the destination URL (see `users.webhook_key`). If several users point `discord_webhook` at the same channel, that channel gets one 🆕 post per job, not one per user.
 
+### A channel per feed
+
+`discord_webhook_feeds` maps a feed to its own public channel, so internships and full-time roles land in different places:
+
+```yaml
+  discord_webhook_feeds:
+    internships: https://discord.com/api/webhooks/.../...
+    new-grad: https://discord.com/api/webhooks/.../...
+```
+
+A feed named here is announced there. A feed left out falls back to `discord_webhook`, so partial configuration is fine — route full-time somewhere new and leave internships where they are.
+
+Naming a channel for a feed is itself enough to start announcing it, with or without `discord_webhook_private`: results go to `results_webhook` either way, so a named feed channel can never receive them. Every URL in the mapping must differ from wherever results go, and loading `users.yaml` fails if it does not — otherwise one channel would get the 🆕 posting *and* the 🎯 scored message with the resume attached.
+
+The routing decision is made when the poller creates a `feed_posts` row, so changing the mapping affects postings discovered afterwards. Rows already queued under the old destination still go to the old channel; see the orphan warning below if you remove a channel rather than repointing it.
+
 ```sql
 -- feed posts waiting to go out
 SELECT COUNT(*) FROM feed_posts WHERE sent_at IS NULL;

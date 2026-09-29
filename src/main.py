@@ -41,8 +41,8 @@ def _log_results_routing(users: list[User]) -> None:
     value, or an empty string all leave `feed_webhook` falsy and previously printed nothing at
     all at boot, indistinguishable from a quiet restart with no new postings.
     """
-    private = [u.id for u in users if u.feed_webhook]
-    public = [u.id for u in users if not u.feed_webhook]
+    private = [u.id for u in users if u.feed_webhooks()]
+    public = [u.id for u in users if not u.feed_webhooks()]
     log.info("Results routing — private webhook: %s; single public webhook: %s",
              ", ".join(private) or "none", ", ".join(public) or "none")
 

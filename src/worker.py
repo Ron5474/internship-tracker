@@ -96,8 +96,10 @@ class Worker:
         self._sessions = session_factory
         self._users = {u.id: u for u in users}
         # key -> URL, so a feed_posts row can be resolved without storing the secret.
-        self._feed_webhooks = {webhook_key(u.feed_webhook): u.feed_webhook
-                               for u in users if u.feed_webhook}
+        # Every public destination across every user and feed, so a row's key resolves to a
+        # URL without the database ever holding one.
+        self._feed_webhooks = {webhook_key(url): url
+                               for u in users for url in u.feed_webhooks().values()}
         self._cvs = dict(cvs or {})
         self._llm = llm
         self._tailor = tailor

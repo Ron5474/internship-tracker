@@ -87,6 +87,6 @@ def _feed_posts_for(job: Job, feed_name: str, section: str, users: list[User]) -
     Users sharing a channel share its key, so the set collapses them. Sorted so a poll
     writes rows in a deterministic order.
     """
-    keys = {webhook_key(u.feed_webhook) for u in users
-            if u.feed_webhook and u.wants(feed_name, section)}
+    keys = {webhook_key(url) for u in users
+            if u.wants(feed_name, section) and (url := u.feed_webhook_for(feed_name))}
     return [FeedPost(job=job, webhook_key=key) for key in sorted(keys)]

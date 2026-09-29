@@ -1651,3 +1651,23 @@ def test_delivery_falls_back_to_the_file_name_without_a_snapshot(session_factory
     sender = FakeSender(OK)
     _worker(session_factory, sender, clock).run_once()
     assert sender.calls[0][3] is None
+
+
+def test_two_channels_resolve_to_their_own_webhooks(session_factory, session, clock):
+    """One key per channel, each resolving to its own URL — the map is what routing rests on."""
+    interns, fulltime = "https://d/interns", "https://d/fulltime"
+    user = RON_SPLIT.model_copy(update={
+        "feeds": ["internships", "new-grad"],
+        "discord_webhook_feeds": {"internships": interns, "new-grad": fulltime},
+    })
+    post = _seed_feed_post(session, key=webhook_key(interns))
+    other = FeedPost(job=post.job, webhook_key=webhook_key(fulltime), next_attempt_at=T0)
+    session.add(other)
+    session.commit()
+
+    sender = FakeSender(OK, OK)
+    w = _worker(session_factory, sender, clock, users=(user,))
+    assert w.run_once() is True
+    assert w.run_once() is True
+    assert w.run_once() is False
+    assert sorted(call[0] for call in sender.calls) == sorted([interns, fulltime])

@@ -14,3 +14,12 @@
   # would otherwise show the same YOUR_ID/YOUR_TOKEN placeholder as the public webhook, and
   # filling in one placeholder for both would send everything to the same channel twice.
   # discord_webhook_private: https://discord.com/api/webhooks/YOUR_OTHER_ID/YOUR_OTHER_TOKEN
+  #
+  # Optional. A separate public channel per feed — internships in one, full-time roles in
+  # another. A feed named here is announced there; any feed not named falls back to
+  # `discord_webhook` above. Naming a channel here is itself enough to start announcing that
+  # feed, with or without discord_webhook_private, since results go elsewhere either way.
+  # Every URL here must differ from wherever results go.
+  # discord_webhook_feeds:
+  #   internships: https://discord.com/api/webhooks/INTERNSHIPS_ID/INTERNSHIPS_TOKEN
+  #   new-grad: https://discord.com/api/webhooks/FULLTIME_ID/FULLTIME_TOKEN

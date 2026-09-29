@@ -212,3 +212,40 @@ def test_a_job_already_known_creates_no_second_feed_post(db):
     before = db.query(FeedPost).count()
     poll_feed(db, SPEC, [FEED_RON], *_github("s3", README_V2))   # same README, new SHA
     assert db.query(FeedPost).count() == before
+
+
+INTERN_CHANNEL = "https://d/interns"
+FULLTIME_CHANNEL = "https://d/fulltime"
+
+
+def test_each_feed_announces_to_its_own_channel(db):
+    """The requirement: internships in one channel, full-time roles in another."""
+    new_grad = FeedSpec("new-grad", "a/c", "dev")
+    u = FEED_RON.model_copy(update={
+        "feeds": ["internships", "new-grad"],
+        "discord_webhook_feeds": {"internships": INTERN_CHANNEL, "new-grad": FULLTIME_CHANNEL},
+    })
+    # Seed both feeds first — a first poll announces nothing — then let each discover a row.
+    poll_feed(db, SPEC, [u], *_github("s1", README_V1))
+    poll_feed(db, new_grad, [u], *_github("n1", README_V1))
+    poll_feed(db, SPEC, [u], *_github("s2", README_V2))
+    poll_feed(db, new_grad, [u], *_github("n2", README_V2))
+
+    posts = db.query(FeedPost).all()
+    assert len(posts) == 2
+    by_key = {p.webhook_key: p.job.feed.name for p in posts}
+    assert by_key == {
+        webhook_key(INTERN_CHANNEL): "internships",
+        webhook_key(FULLTIME_CHANNEL): "new-grad",
+    }
+
+
+def test_a_feed_without_its_own_channel_still_uses_the_shared_one(db):
+    # Partial configuration: full-time gets a new home, internships stay where they were.
+    u = FEED_RON.model_copy(update={
+        "feeds": ["internships", "new-grad"],
+        "discord_webhook_feeds": {"new-grad": FULLTIME_CHANNEL},
+    })
+    poll_feed(db, SPEC, [u], *_github("s1", README_V1))
+    poll_feed(db, SPEC, [u], *_github("s2", README_V2))
+    assert [p.webhook_key for p in db.query(FeedPost).all()] == [webhook_key(SHARED)]

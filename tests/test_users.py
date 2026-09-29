@@ -2,6 +2,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from users import User, load_users, webhook_key
 
@@ -100,13 +101,13 @@ def test_without_a_private_webhook_everything_goes_to_the_one_destination():
     u = _user()
     assert u.results_webhook == "https://d/shared"
     # No feed webhook: a single-destination user would otherwise get every posting twice.
-    assert u.feed_webhook is None
+    assert u.feed_webhook_for("internships") is None
 
 
 def test_with_a_private_webhook_the_shared_one_becomes_the_feed():
     u = _user(discord_webhook_private="https://d/private")
     assert u.results_webhook == "https://d/private"
-    assert u.feed_webhook == "https://d/shared"
+    assert u.feed_webhook_for("internships") == "https://d/shared"
 
 
 def test_webhook_key_is_stable_and_not_the_url():
@@ -139,3 +140,78 @@ def test_private_webhook_same_as_public_is_rejected():
     # Configured this way, one channel would get both the feed post and the full scored message.
     with pytest.raises(ValueError):
         _user(discord_webhook="https://d/shared", discord_webhook_private="https://d/shared")
+
+
+# --- per-feed public channels -------------------------------------------------------------
+
+INTERN_HOOK = "https://d/internships"
+FULLTIME_HOOK = "https://d/fulltime"
+
+
+def _split_user(**kw):
+    base = dict(id="ron", cv="/x", discord_webhook="https://d/shared",
+                discord_webhook_private="https://d/private",
+                feeds=["internships", "new-grad"], sections=["software"])
+    return User(**{**base, **kw})
+
+
+def test_a_feed_with_its_own_channel_uses_it():
+    u = _split_user(discord_webhook_feeds={"internships": INTERN_HOOK, "new-grad": FULLTIME_HOOK})
+    assert u.feed_webhook_for("internships") == INTERN_HOOK
+    assert u.feed_webhook_for("new-grad") == FULLTIME_HOOK
+
+
+def test_a_feed_without_its_own_channel_falls_back_to_the_shared_one():
+    # Partial configuration is legitimate: route full-time somewhere new, leave the rest alone.
+    u = _split_user(discord_webhook_feeds={"new-grad": FULLTIME_HOOK})
+    assert u.feed_webhook_for("new-grad") == FULLTIME_HOOK
+    assert u.feed_webhook_for("internships") == "https://d/shared"
+
+
+def test_per_feed_channels_work_without_a_private_webhook():
+    # Naming a public channel for a feed is itself the opt-in; it cannot double-post, because
+    # results go to discord_webhook and postings go somewhere else entirely.
+    u = User(id="ron", cv="/x", discord_webhook="https://d/shared",
+             discord_webhook_feeds={"internships": INTERN_HOOK},
+             feeds=["internships", "new-grad"], sections=["software"])
+    assert u.feed_webhook_for("internships") == INTERN_HOOK
+    assert u.feed_webhook_for("new-grad") is None        # no private webhook, no override
+    assert u.results_webhook == "https://d/shared"
+
+
+def test_no_feed_channels_and_no_private_webhook_announces_nothing():
+    u = User(id="ron", cv="/x", discord_webhook="https://d/shared",
+             feeds=["internships"], sections=["software"])
+    assert u.feed_webhook_for("internships") is None
+    assert u.feed_webhooks() == {}
+
+
+def test_feed_webhooks_lists_every_destination_by_feed():
+    u = _split_user(discord_webhook_feeds={"internships": INTERN_HOOK})
+    assert u.feed_webhooks() == {"internships": INTERN_HOOK, "new-grad": "https://d/shared"}
+
+
+def test_feed_webhooks_covers_only_subscribed_feeds():
+    u = _split_user(feeds=["internships"],
+                    discord_webhook_feeds={"internships": INTERN_HOOK, "new-grad": FULLTIME_HOOK})
+    assert list(u.feed_webhooks()) == ["internships"]
+
+
+def test_an_unknown_feed_name_is_rejected():
+    with pytest.raises(ValidationError):
+        _split_user(discord_webhook_feeds={"podcasts": INTERN_HOOK})
+
+
+def test_a_feed_channel_may_not_be_the_results_channel():
+    # Otherwise that channel gets the 🆕 posting and the 🎯 scored message with the resume.
+    with pytest.raises(ValidationError):
+        _split_user(discord_webhook_feeds={"internships": "https://d/private"})
+    with pytest.raises(ValidationError):
+        User(id="ron", cv="/x", discord_webhook="https://d/shared",
+             discord_webhook_feeds={"internships": "https://d/shared"},
+             feeds=["internships"], sections=["software"])
+
+
+def test_an_empty_feed_channel_url_is_rejected():
+    with pytest.raises(ValidationError):
+        _split_user(discord_webhook_feeds={"internships": ""})
