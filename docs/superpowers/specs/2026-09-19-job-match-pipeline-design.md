@@ -294,7 +294,7 @@ The validated selection is stored on the evaluation (`tailored`) so a re-render 
 
 `render.py`: CV snapshot + validated selection → Jinja2 HTML template → WeasyPrint → `$DATA_DIR/output/<user>/<job_id>-<company>.pdf`. One HTML template and one CSS file shared by all users, styled to resemble the current CV layout.
 
-One page is the target, enforced by content limits rather than trimming loops: the bullet cap and a cap on rendered entries (default 4 experience + 3 projects, the LLM's order deciding which survive). After rendering, check the page count; if it is still more than one page, keep the PDF, set `page_overflow=true`, and mention it in the Discord message. The user decides whether to trim by hand.
+One page is the target, enforced by measuring the rendered page. **Amended 2026-10-06:** this originally said content caps rather than a trimming loop. In production the same count of bullets landed anywhere from 74% of a page to two pages, because bullets run from one line to three — no fixed cap can absorb that. `render.fit_to_page` now renders, measures and adjusts: over one page it drops the least relevant bullet (projects before experience, the last entry first, an entry dropped whole once down to one bullet, the last experience entry never); under 90% full it adds back the candidate's own unselected bullets, deepening shown entries before adding new ones and skipping any that would spill over. Fonts and margins never change. The fitted selection is stored, so a re-render reproduces it.
 
 ## Delivery
 

@@ -26,7 +26,7 @@ from db import (
 from discord_client import DeliveryResult, format_link_only, format_match, send_message
 from fetcher import DESCRIPTION_CAP, FetchResult, fetch_description, has_requirements
 from llm import LLMResult
-from render import UNDERFILL_BELOW, RenderResult, attachment_name, output_path, render_pdf
+from render import UNDERFILL_BELOW, RenderResult, attachment_name, fit_to_page, output_path
 from users import User, webhook_key
 
 log = logging.getLogger(__name__)
@@ -86,7 +86,7 @@ class Worker:
         cvs: dict[str, dict] | None = None,
         llm=None,
         tailor=None,
-        render: Callable[..., "RenderResult"] = render_pdf,
+        render: Callable[..., "RenderResult"] = fit_to_page,
         output_dir: str | None = None,
         max_bullets: int = 4,
         send: Callable[..., DeliveryResult] = send_message,
@@ -559,6 +559,10 @@ class Worker:
             return
 
         after = self._now()
+        if result.selection is not None:
+            # The fit trimmed or added content; store what was actually rendered, so a
+            # re-render reproduces this page rather than the pre-fit selection.
+            ev.tailored = result.selection
         ev.pdf_path, ev.page_overflow = result.path, result.overflow
         ev.page_fill = round(result.fill * 100)
         ev.stage, ev.attempts, ev.next_attempt_at = STAGE_DELIVER, 0, after
