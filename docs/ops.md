@@ -1,5 +1,20 @@
 # Operations notes
 
+## Deploying a merge
+
+Docker Hub gets the image a minute or two after the merge lands on `main` — check the
+Actions tab is green first; a `docker compose pull` run before that quietly keeps the old
+image. Then, on the server:
+
+```bash
+cd ~/deployed-projects/internship-tracker
+docker compose pull && docker compose up -d       # pull alone does not restart
+docker compose logs --since 1m | grep "Tracker starting"
+```
+
+The line reads `Tracker starting (build <sha>)`; the sha is the merge commit's first seven
+characters, which `git log --oneline -1 origin/main` shows. `build dev` means a local build.
+
 ## Fetch success by host (last 7 days)
 
 Run on the server: `sqlite3 data/tracker.db` then
