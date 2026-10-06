@@ -296,6 +296,8 @@ The validated selection is stored on the evaluation (`tailored`) so a re-render 
 
 One page is the target, enforced by measuring the rendered page. **Amended 2026-10-06:** this originally said content caps rather than a trimming loop. In production the same count of bullets landed anywhere from 74% of a page to two pages, because bullets run from one line to three — no fixed cap can absorb that. `render.fit_to_page` now renders, measures and adjusts: over one page it drops the least relevant bullet (projects before experience, the last entry first, an entry dropped whole once down to one bullet, the last experience entry never); under 90% full it adds back the candidate's own unselected bullets, deepening shown entries before adding new ones and skipping any that would spill over. Fonts and margins never change. The fitted selection is stored, so a re-render reproduces it.
 
+**Amended 2026-10-06 (later the same day):** what gets added back is now the model's choice, not the master's order. The tailor prompt asks for every bullet worth showing and every project with some relevance, ranked; `validate_selection` cuts at the caps as before but keeps what fell past them under `reserve` (`[section, entry_id, bullet_id]` rows, model order — spare bullets of shown entries first, then entries that did not make the cut). `fit_to_page` draws on the reserve first and only then on the master's order. The per-entry cap therefore governs the first cut, not the final page: an entry may show a fifth bullet when the model ranked it and the page has room. Rows tailored before this change have no reserve and fill as before.
+
 ## Delivery
 
 Per-user Discord webhook. Contract:

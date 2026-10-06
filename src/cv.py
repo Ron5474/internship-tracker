@@ -157,8 +157,9 @@ def cv_to_id_text(cv: MasterCV) -> str:
     return "\n".join(lines)
 
 
-def _validate_entries(allowed, raw_list, max_bullets, max_entries, kind, warnings):
-    """Keep the model's order; drop anything that is not in `allowed`."""
+def _validate_entries(allowed, raw_list, max_bullets, kind, warnings):
+    """Keep the model's order; drop anything that is not in `allowed`. Nothing is cut here:
+    the caller splits the ranked result into what makes the page and what is spare."""
     out, seen = [], set()
     for item in raw_list or []:
         if not isinstance(item, dict):
@@ -183,15 +184,24 @@ def _validate_entries(allowed, raw_list, max_bullets, max_entries, kind, warning
                 continue
             seen_bullets.add(bid)
             bullets.append(bid)
-            if len(bullets) == max_bullets:
-                break
         if not bullets:   # an entry with no usable bullets is an empty block on the page
             bullets = [b.id for b in entry.bullets][:max_bullets]
             warnings.append(f"{kind}: {entry_id!r} had no usable bullets; used the master's first {len(bullets)}")
         out.append({"id": entry_id, "bullets": bullets})
-        if len(out) == max_entries:
-            break
     return out
+
+
+def _cut(ranked, max_bullets, max_entries, kind):
+    """Split a ranked section into the entries that make the page and the spares.
+
+    Returns (shown, deeper, newer). Spares are `[kind, entry_id, bullet_id]` rows in the
+    model's order: `deeper` are bullets past the cap of entries that made the page, `newer`
+    every bullet of entries that did not.
+    """
+    shown = [{"id": e["id"], "bullets": e["bullets"][:max_bullets]} for e in ranked[:max_entries]]
+    deeper = [[kind, e["id"], b] for e in ranked[:max_entries] for b in e["bullets"][max_bullets:]]
+    newer = [[kind, e["id"], b] for e in ranked[max_entries:] for b in e["bullets"]]
+    return shown, deeper, newer
 
 
 def _top_up_entries(chosen, entries, max_bullets, max_entries):
@@ -239,15 +249,24 @@ def validate_selection(cv: MasterCV, raw: dict, max_bullets: int = 4) -> tuple[d
 
     Only IDs that exist in THIS CV survive, a bullet must belong to the entry it is listed
     under, skills must be a subset of the master's, and the caps are enforced. The model's
-    ordering is respected for everything that survives. Returns (selection, warnings).
+    ordering is respected for everything that survives: what it ranked past a cap is not
+    dropped but returned under "reserve", in its order, for fit_to_page to draw on when the
+    page has room. Returns (selection, warnings).
     """
     warnings: list[str] = []
     raw = raw or {}
 
-    exp = _validate_entries({e.id: e for e in cv.experience}, raw.get("experience"),
-                            max_bullets, MAX_EXPERIENCE_ENTRIES, "experience", warnings)
-    proj = _validate_entries({p.id: p for p in cv.projects}, raw.get("projects"),
-                             max_bullets, MAX_PROJECT_ENTRIES, "projects", warnings)
+    exp, exp_deeper, exp_newer = _cut(
+        _validate_entries({e.id: e for e in cv.experience}, raw.get("experience"), max_bullets,
+                          "experience", warnings),
+        max_bullets, MAX_EXPERIENCE_ENTRIES, "experience")
+    proj, proj_deeper, proj_newer = _cut(
+        _validate_entries({p.id: p for p in cv.projects}, raw.get("projects"), max_bullets,
+                          "projects", warnings),
+        max_bullets, MAX_PROJECT_ENTRIES, "projects")
+    # The order fit_to_page adds them in: deepen what is on the page (experience, then projects)
+    # before adding entries that did not make the cut.
+    reserve = exp_deeper + proj_deeper + exp_newer + proj_newer
 
     # Per-section top-up: a near-empty section looks thin, but the model's picks are the
     # tailoring, so they stay and the master only fills the gap.
@@ -277,4 +296,4 @@ def validate_selection(cv: MasterCV, raw: dict, max_bullets: int = 4) -> tuple[d
         warnings.append(f"skills: {selected_count} selected; topped up to "
                         f"{sum(len(v) for v in skills.values())} from the master")
 
-    return {"experience": exp, "projects": proj, "skills": skills}, warnings
+    return {"experience": exp, "projects": proj, "skills": skills, "reserve": reserve}, warnings

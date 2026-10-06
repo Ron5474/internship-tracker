@@ -48,4 +48,12 @@ def test_reask_names_the_problem():
 def test_tailor_user_message_puts_the_cv_before_the_posting():
     msg = tailor_user_message("JD TEXT", "CV TEXT", 4)
     assert msg.index("CV TEXT") < msg.index("JD TEXT")
-    assert "at most 4 bullets" in msg
+    assert "first 4 bullets" in msg and "spare" in msg
+
+
+def test_tailor_prompt_asks_for_spares_past_the_cut():
+    from prompts import TAILOR_SYSTEM
+    flat = " ".join(TAILOR_SYSTEM.split())
+    assert "spare" in flat
+    assert "every bullet worth showing" in flat
+    assert "every project with some relevance" in flat

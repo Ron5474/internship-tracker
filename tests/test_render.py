@@ -369,3 +369,45 @@ def test_fitting_with_the_real_renderer_produces_one_page(cv, tmp_path):
     result = fit_to_page(cv, fat, str(tmp_path / "r.pdf"))
     assert result.pages == 1
     assert Path(result.path).read_bytes().startswith(b"%PDF")
+
+
+# --- fill from the model's spares ----------------------------------------------------------
+
+
+def test_filling_takes_the_models_spares_before_the_masters_order(cv, tmp_path):
+    entry = cv.experience[0]
+    b1, b2, b3 = (b.id for b in entry.bullets[:3])
+    sel = {"experience": [{"id": entry.id, "bullets": [b1]}], "projects": [], "skills": {},
+           "reserve": [["experience", entry.id, b3]]}
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=2))
+    assert _bullets(result.selection, "experience") == [b1, b3]
+
+
+def test_spares_run_out_and_then_the_masters_order_fills(cv, tmp_path):
+    entry = cv.experience[0]
+    b1, b2, b3 = (b.id for b in entry.bullets[:3])
+    sel = {"experience": [{"id": entry.id, "bullets": [b1]}], "projects": [], "skills": {},
+           "reserve": [["experience", entry.id, b3]]}
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=3))
+    assert _bullets(result.selection, "experience") == [b1, b3, b2]
+
+
+def test_a_spare_that_is_already_shown_or_not_in_the_cv_is_ignored(cv, tmp_path):
+    entry = cv.experience[0]
+    b1, b2 = (b.id for b in entry.bullets[:2])
+    sel = {"experience": [{"id": entry.id, "bullets": [b1]}], "projects": [], "skills": {},
+           "reserve": [["experience", entry.id, b1], ["projects", "ghost", "ghost.b1"],
+                       ["experience", entry.id, "exp9.b9"]]}
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=2))
+    assert _bullets(result.selection, "experience") == [b1, b2]
+    assert all(e["id"] != "ghost" for e in result.selection["projects"])
+
+
+def test_a_spare_project_is_added_as_a_new_entry(cv, tmp_path):
+    entry, spare = cv.experience[0], cv.projects[-1]
+    sel = {"experience": [{"id": entry.id, "bullets": [b.id for b in entry.bullets]}],
+           "projects": [], "skills": {},
+           "reserve": [["projects", spare.id, b.id] for b in spare.bullets]}
+    capacity = len(entry.bullets) + len(spare.bullets)
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=capacity))
+    assert result.selection["projects"] == [{"id": spare.id, "bullets": [b.id for b in spare.bullets]}]
