@@ -71,7 +71,7 @@ Expect `200`, and the model alias in `LLM_SCORE_MODEL` must appear in that `/mod
 | --- | --- |
 | `outcome=matched` / `outcome=below_threshold` | healthy |
 | `outcome=invalid` on every row | the model is not honouring the strict schema — read `error=` for the failing field |
-| `outcome=unavailable` and `Pausing llm` every 15 min | URL, key or model alias is wrong; fix `.env` and restart rather than waiting |
+| `outcome=unavailable` and `Pausing llm` repeating (1 min, then 5, then every 15) | URL, key or model alias is wrong; fix `.env` and restart rather than waiting. A single one that does not repeat was a blip (LiteLLM restarting) and clears itself |
 | `Pausing llm (3 consecutive invalid replies…)` | the breaker: three invalid replies in a row, same cause as above |
 | `outcome=unusable` | the model says the fetched text is not a posting; the row is delivered link-only |
 

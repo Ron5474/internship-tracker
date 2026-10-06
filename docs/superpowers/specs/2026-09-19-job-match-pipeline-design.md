@@ -165,7 +165,7 @@ Every external call is classified before deciding what to do:
 | Class | Examples | Handling |
 |---|---|---|
 | Transient | timeout, connection error, 5xx, 429 | Retry with exponential backoff (30 s → 1 min → 5 min → 15 min → 1 h), honoring `Retry-After` when present. Counts against the stage's budget. |
-| Service unavailable | LLM endpoint refuses connections or returns 401/403 | Pause that service: log at ERROR once, set `next_attempt_at` 15 min ahead on the affected row, **do not** increment `attempts`. Queued evaluations wait for the service to come back. |
+| Service unavailable | LLM endpoint refuses connections or returns 401/403 | Pause that service: log at ERROR once, set `next_attempt_at` ahead on the affected row — 1 min for the first unavailable reply, 5 min for the next consecutive one, 15 min from then on (amended 2026-10-06: a flat 15 min turned a seconds-long LiteLLM restart into a quarter-hour stall); any other reply resets the ladder — **do not** increment `attempts`. Queued evaluations wait for the service to come back. |
 | Item invalid | LLM response fails schema validation (after the client's single in-call re-ask), PDF render throws on this input | Counts as one failed attempt against the stage budget. |
 | Item gone | ATS API 404 for this posting | Treated as permanent for the fetch stage: an ATS API 404 means the posting is gone; the link-only fallback still notifies. |
 | Destination gone | Discord webhook returns 404 or 401 | Pause `discord:<user_id>` until restart (see Paused services). Does not count against delivery attempts. |
