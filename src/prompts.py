@@ -57,8 +57,11 @@ Keep each list item under 12 words. Empty lists are fine.
 """
 
 
+# The CV comes before the posting in both user messages. The CV is identical for every
+# posting a user is scored against, so system prompt + CV form a stable prefix the endpoint
+# can serve from its prompt cache; the posting is the part that changes, and it goes last.
 def score_user_message(description: str, cv_text: str) -> str:
-    return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}\n\nReturn the JSON object now."
+    return f"CANDIDATE CV:\n{cv_text}\n\n---\n\nJOB POSTING:\n{description}\n\nReturn the JSON object now."
 
 
 def reask_message(problem: str) -> str:
@@ -74,8 +77,10 @@ verbatim in the CV you are given. Any text you produce instead of an ID is a fai
 
 How to choose:
 - Pick the experience entries and project entries whose evidence best matches this posting, most
-  relevant first. The first ones you list are the ones that make the page.
-- Inside each entry, list only the bullet IDs worth keeping, most relevant first.
+  relevant first. The first ones you list make the page. List every project with some relevance:
+  the ones past the cut are spares, added in your order when the page has room.
+- Inside each entry, list every bullet worth showing, most relevant first. The first few make the
+  page and the rest are spares, so leave a bullet out only when it is irrelevant to this posting.
 - A bullet ID must be listed under the entry it belongs to. Bullet IDs start with their entry's ID.
 - Skills: keep every skill that is plausibly relevant, under the same group names the CV uses,
   most relevant first. Aim for 15-25. They cost about one line per ten, and a four-item skills
@@ -96,6 +101,7 @@ Every value in "bullets" is a string ID. Empty lists are allowed.
 
 def tailor_user_message(description: str, cv_id_text: str, max_bullets: int) -> str:
     return (
-        f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV (IDs in brackets):\n{cv_id_text}\n\n"
-        f"Select at most {max_bullets} bullets per entry. Return the JSON object now."
+        f"CANDIDATE CV (IDs in brackets):\n{cv_id_text}\n\n---\n\nJOB POSTING:\n{description}\n\n"
+        f"The first {max_bullets} bullets of each entry make the page; later ones are spares. "
+        "Return the JSON object now."
     )

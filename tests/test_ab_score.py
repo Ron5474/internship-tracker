@@ -83,14 +83,31 @@ def _reply(monkeypatch, status=200, body=None, boom=None):
     monkeypatch.setattr(ab_score.requests, "post", fake_post)
 
 
-def _ok_body(score=77, reasoning_tokens=None, completion=120):
+def _ok_body(score=77, reasoning_tokens=None, completion=120, cached_tokens=None):
     details = {"reasoning_tokens": reasoning_tokens} if reasoning_tokens is not None else {}
+    usage = {"completion_tokens": completion, "completion_tokens_details": details}
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
     return {
         "choices": [{"message": {"content": json.dumps({
             "score": score, "reasoning": "why", "missing_confirmed": [], "missing_unknown": [],
         })}}],
-        "usage": {"completion_tokens": completion, "completion_tokens_details": details},
+        "usage": usage,
     }
+
+
+def test_ask_reads_the_cached_prompt_tokens(monkeypatch):
+    _reply(monkeypatch, body=_ok_body(cached_tokens=2900))
+    assert ab_score.ask("http://x", {}, "flash", [], {}, 10).cached_tokens == 2900
+
+
+def test_report_shows_average_cached_prompt_tokens(capsys):
+    row = ab_score.Row(1, 80, "Acme", "Dev", [])
+    row.results = [ab_score.Result(80, 900, 10, 120, cached_tokens=2900)]
+    other = ab_score.Row(2, 70, "Acme", "Ops", [])
+    other.results = [ab_score.Result(70, 900, 10, 120, cached_tokens=640)]
+    ab_score.report([row, other], [{}])
+    assert "1770 cached prompt tokens avg" in capsys.readouterr().out
 
 
 def test_ask_parses_a_score_and_the_reasoning_tokens(monkeypatch):

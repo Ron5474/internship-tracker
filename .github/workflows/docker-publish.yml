@@ -35,6 +35,7 @@ jobs:
           push: false
           load: true
           tags: internship-tracker:ci
+          build-args: GIT_SHA=${{ github.sha }}
 
       - name: Smoke-test the image renders a PDF
         run: |
@@ -67,3 +68,4 @@ jobs:
           context: .
           push: true
           tags: ${{ secrets.DOCKERHUB_USERNAME }}/internship-tracker:latest
+          build-args: GIT_SHA=${{ github.sha }}

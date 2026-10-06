@@ -19,6 +19,9 @@ COPY src/ ./src/
 # reachable. They are never started by the daemon — see scripts/README.md.
 COPY scripts/ ./scripts/
 
-ENV PYTHONPATH=/app/src
+# The commit this image was built from, printed in the "Tracker starting" log line so a
+# deploy can be confirmed from the logs alone. CI passes it; a local build gets "dev".
+ARG GIT_SHA=dev
+ENV PYTHONPATH=/app/src BUILD_SHA=$GIT_SHA
 
 CMD ["python", "src/main.py"]

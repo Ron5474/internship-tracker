@@ -104,8 +104,8 @@ def main() -> None:
     settings = load_settings(os.environ)
     users = load_users(os.path.join(settings.data_dir, "users.yaml"))
     cvs = load_cvs(users)   # before the migration loop below, which retries GitHub forever
-    log.info("Tracker starting: %d users, feeds %s, interval %ds",
-             len(users), list(FEEDS), settings.poll_interval)
+    log.info("Tracker starting (build %s): %d users, feeds %s, interval %ds",
+             settings.build_sha, len(users), list(FEEDS), settings.poll_interval)
 
     _log_results_routing(users)
 

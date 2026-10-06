@@ -1,5 +1,20 @@
 # Operations notes
 
+## Deploying a merge
+
+Docker Hub gets the image a minute or two after the merge lands on `main` — check the
+Actions tab is green first; a `docker compose pull` run before that quietly keeps the old
+image. Then, on the server:
+
+```bash
+cd ~/deployed-projects/internship-tracker
+docker compose pull && docker compose up -d       # pull alone does not restart
+docker compose logs --since 1m | grep "Tracker starting"
+```
+
+The line reads `Tracker starting (build <sha>)`; the sha is the merge commit's first seven
+characters, which `git log --oneline -1 origin/main` shows. `build dev` means a local build.
+
 ## Fetch success by host (last 7 days)
 
 Run on the server: `sqlite3 data/tracker.db` then
@@ -71,7 +86,7 @@ Expect `200`, and the model alias in `LLM_SCORE_MODEL` must appear in that `/mod
 | --- | --- |
 | `outcome=matched` / `outcome=below_threshold` | healthy |
 | `outcome=invalid` on every row | the model is not honouring the strict schema — read `error=` for the failing field |
-| `outcome=unavailable` and `Pausing llm` every 15 min | URL, key or model alias is wrong; fix `.env` and restart rather than waiting |
+| `outcome=unavailable` and `Pausing llm` repeating (1 min, then 5, then every 15) | URL, key or model alias is wrong; fix `.env` and restart rather than waiting. A single one that does not repeat was a blip (LiteLLM restarting) and clears itself |
 | `Pausing llm (3 consecutive invalid replies…)` | the breaker: three invalid replies in a row, same cause as above |
 | `outcome=unusable` | the model says the fetched text is not a posting; the row is delivered link-only |
 

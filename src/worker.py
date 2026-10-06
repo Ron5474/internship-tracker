@@ -42,6 +42,10 @@ TAILOR_BUDGET = 3
 RENDER_BUDGET = 2
 LLM_PAUSE_SECONDS = 900
 INVALID_STREAK_LIMIT = 3
+# An "unavailable" reply (connection refused, 401/403/404) pauses that model: briefly for the
+# first one — a LiteLLM restart is over in seconds — and for longer on each consecutive repeat,
+# which is what a wrong key or alias looks like. Any other answer from the model resets it.
+UNAVAILABLE_PAUSE_SECONDS = (60, 300, 900)
 
 _LINK_ONLY_NOTES = {
     "fetch_failed": "couldn't read the description",
@@ -113,6 +117,7 @@ class Worker:
         self._fetch_not_before: datetime | None = None
         self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
         self._tailor_invalid_streak = 0   # own counter — never shared with score()'s _invalid_streak
+        self._unavailable_streak: dict[str, int] = {}   # alias -> consecutive unavailable replies
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -145,6 +150,16 @@ class Worker:
     def _model_name(client) -> str:
         """The alias this client was configured with — the only thing pause keys are built from."""
         return getattr(client, "model", "?")
+
+    def _pause_unavailable(self, client, after: datetime, why: str) -> datetime:
+        """Pause this model's alias for the streak's step and return when it resumes."""
+        alias = self._model_name(client)
+        streak = self._unavailable_streak.get(alias, 0) + 1
+        self._unavailable_streak[alias] = streak
+        step = UNAVAILABLE_PAUSE_SECONDS[min(streak, len(UNAVAILABLE_PAUSE_SECONDS)) - 1]
+        resume = after + timedelta(seconds=step)
+        self._pause(f"llm:{alias}", resume, why)
+        return resume
 
     def _llm_paused(self, client) -> bool:
         # "llm" is the endpoint (a 429/5xx holds both stages); "llm:<alias>" is one bad model or key.
@@ -211,7 +226,9 @@ class Worker:
     def run_once(self) -> bool:
         # Ready messages first (private results, then the public feed slot — one HTTP call,
         # so a posting reaches the shared channel within seconds), then cheap network, then
-        # local CPU, then the cheap LLM call, then the expensive one.
+        # local CPU, then the LLM stages. Tailoring goes before scoring: a match is one call
+        # from its resume, and finishing it beats starting another posting — with scoring
+        # first, the first match of a batch waited for the whole batch to be scored.
         with self._sessions() as session:
             ev = self._next_deliverable(session)
             if ev is not None:
@@ -233,14 +250,14 @@ class Worker:
                 self.render(session, ev)
                 session.commit()
                 return True
-            ev = self._next_scoreable(session)
-            if ev is not None:
-                self.score(session, ev)
-                session.commit()
-                return True
             ev = self._next_tailorable(session)
             if ev is not None:
                 self.tailor(session, ev)
+                session.commit()
+                return True
+            ev = self._next_scoreable(session)
+            if ev is not None:
+                self.score(session, ev)
                 session.commit()
                 return True
             return False
@@ -442,6 +459,8 @@ class Worker:
                  usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
                  f" error={result.error}" if result.error else "")
 
+        if result.kind != "unavailable":
+            self._unavailable_streak.pop(self._model_name(self._llm), None)
         if result.kind == "invalid":
             self._invalid_streak += 1
             if self._invalid_streak >= INVALID_STREAK_LIMIT:
@@ -479,9 +498,7 @@ class Worker:
         if result.kind == "unavailable":
             # Outage or config problem: not this row's fault. Give the lease back and hold every row.
             ev.attempts -= 1
-            resume = after + timedelta(seconds=LLM_PAUSE_SECONDS)
-            ev.next_attempt_at = resume
-            self._pause(f"llm:{self._model_name(self._llm)}", resume, result.error or "unavailable")
+            ev.next_attempt_at = self._pause_unavailable(self._llm, after, result.error or "unavailable")
             return
 
         ev.last_error = result.error
@@ -614,6 +631,8 @@ class Worker:
                  ev.id, ev.user_id, result.model or getattr(self._tailor, "model", "?"),
                  result.kind, result.ms, f" error={result.error}" if result.error else "")
 
+        if result.kind != "unavailable":
+            self._unavailable_streak.pop(self._model_name(self._tailor), None)
         if result.kind == "invalid":
             # A model that does not honour JSON mode costs two billed calls per _ask; without a
             # breaker here TAILOR_BUDGET burns the pricier model with no cooldown between rows.
@@ -640,11 +659,10 @@ class Worker:
             # wrong/renamed LLM_TAILOR_MODEL alias will not fix itself on retry. Keeping the lease
             # here is what lets the row reach TAILOR_BUDGET and degrade via _give_up_resume instead
             # of looping forever at attempts==0.
-            resume = after + timedelta(seconds=LLM_PAUSE_SECONDS)
             # The CONFIGURED alias, never result.model. On a re-ask whose first call succeeded and
             # whose second returned 401, LLMResult carries the backend's own model name — pausing
             # that would write a key `_llm_paused` never reads, and the cooldown would do nothing.
-            self._pause(f"llm:{self._model_name(self._tailor)}", resume, result.error or "unavailable")
+            resume = self._pause_unavailable(self._tailor, after, result.error or "unavailable")
             if ev.attempts >= TAILOR_BUDGET:
                 self._give_up_resume(ev, after, result.error or "unavailable")
                 return

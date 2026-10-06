@@ -84,9 +84,11 @@ def test_system_prompt_carries_rubric_and_schema():
     assert '"posting_usable": <true|false>' in flat
 
 
-def test_user_message_contains_both_inputs_in_order():
+def test_user_message_puts_the_cv_before_the_posting():
+    # The CV is the same for every posting; leading with it makes system prompt + CV a shared
+    # prefix the endpoint can cache. The posting is what changes, so it goes last.
     m = score_user_message("JOB TEXT", "CV TEXT")
-    assert m.index("JOB TEXT") < m.index("CV TEXT")
+    assert m.index("CV TEXT") < m.index("JOB TEXT")
     assert m.endswith("Return the JSON object now.")
 
 
