@@ -57,8 +57,11 @@ Keep each list item under 12 words. Empty lists are fine.
 """
 
 
+# The CV comes before the posting in both user messages. The CV is identical for every
+# posting a user is scored against, so system prompt + CV form a stable prefix the endpoint
+# can serve from its prompt cache; the posting is the part that changes, and it goes last.
 def score_user_message(description: str, cv_text: str) -> str:
-    return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}\n\nReturn the JSON object now."
+    return f"CANDIDATE CV:\n{cv_text}\n\n---\n\nJOB POSTING:\n{description}\n\nReturn the JSON object now."
 
 
 def reask_message(problem: str) -> str:
@@ -96,6 +99,6 @@ Every value in "bullets" is a string ID. Empty lists are allowed.
 
 def tailor_user_message(description: str, cv_id_text: str, max_bullets: int) -> str:
     return (
-        f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV (IDs in brackets):\n{cv_id_text}\n\n"
+        f"CANDIDATE CV (IDs in brackets):\n{cv_id_text}\n\n---\n\nJOB POSTING:\n{description}\n\n"
         f"Select at most {max_bullets} bullets per entry. Return the JSON object now."
     )

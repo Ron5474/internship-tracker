@@ -7,7 +7,7 @@ are matches. A careless edit that drops the gate produces no test failure anywhe
 the damage only shows up days later as noise in Discord.
 """
 
-from prompts import SCORE_SYSTEM, reask_message, score_user_message
+from prompts import SCORE_SYSTEM, reask_message, score_user_message, tailor_user_message
 
 
 def test_score_prompt_asks_for_the_discipline_decision_first():
@@ -43,3 +43,9 @@ def test_score_user_message_carries_both_inputs_and_closes_with_the_instruction(
 
 def test_reask_names_the_problem():
     assert "bad key" in reask_message("bad key")
+
+
+def test_tailor_user_message_puts_the_cv_before_the_posting():
+    msg = tailor_user_message("JD TEXT", "CV TEXT", 4)
+    assert msg.index("CV TEXT") < msg.index("JD TEXT")
+    assert "at most 4 bullets" in msg
