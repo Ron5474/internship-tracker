@@ -211,7 +211,9 @@ class Worker:
     def run_once(self) -> bool:
         # Ready messages first (private results, then the public feed slot — one HTTP call,
         # so a posting reaches the shared channel within seconds), then cheap network, then
-        # local CPU, then the cheap LLM call, then the expensive one.
+        # local CPU, then the LLM stages. Tailoring goes before scoring: a match is one call
+        # from its resume, and finishing it beats starting another posting — with scoring
+        # first, the first match of a batch waited for the whole batch to be scored.
         with self._sessions() as session:
             ev = self._next_deliverable(session)
             if ev is not None:
@@ -233,14 +235,14 @@ class Worker:
                 self.render(session, ev)
                 session.commit()
                 return True
-            ev = self._next_scoreable(session)
-            if ev is not None:
-                self.score(session, ev)
-                session.commit()
-                return True
             ev = self._next_tailorable(session)
             if ev is not None:
                 self.tailor(session, ev)
+                session.commit()
+                return True
+            ev = self._next_scoreable(session)
+            if ev is not None:
+                self.score(session, ev)
                 session.commit()
                 return True
             return False

@@ -1094,10 +1094,12 @@ def test_score_without_llm_configured_is_skipped(session_factory, session, clock
 def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, session, clock, tmp_path):
     _seed_scoreable(session, "ron")
     _seed_tailorable(session, "cousin")
-    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), FakeTailor(), clock, tmp_path)
-    w.run_once()
+    tailor = FakeTailor()
+    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), tailor, clock, tmp_path)
+    while w.run_once():
+        pass
     assert w.is_paused("llm:flash") is True and w.is_paused("llm:pro") is False
-    assert w.run_once() is True          # the tailor row still moves
+    assert len(tailor.calls) == 1        # the tailor row still moved
 
 
 # --- tailor ------------------------------------------------------------------
@@ -1558,14 +1560,15 @@ def test_render_runs_before_score(session_factory, session, clock, tmp_path):
     assert len(renderer.calls) == 1 and len(llm.calls) == 0
 
 
-def test_score_runs_before_tailor(session_factory, session, clock, tmp_path):
-    # The cheap model's queue drains before the expensive one's.
+def test_tailor_runs_before_score(session_factory, session, clock, tmp_path):
+    # A match that is one call from its resume finishes before another posting is started:
+    # with scoring first, the first match of a batch waited for the whole batch to be scored.
     _seed_scoreable(session, "ron")
     _seed_tailorable(session, "cousin")
     llm, tailor = FakeLLM(_llm_ok()), FakeTailor()
     w = _worker_st(session_factory, llm, tailor, clock, tmp_path)
     w.run_once()
-    assert len(llm.calls) == 1 and tailor.calls == []
+    assert len(tailor.calls) == 1 and llm.calls == []
 
 
 # --- startup: draining rows a tailorless process cannot run -----------------
