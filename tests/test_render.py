@@ -1,9 +1,10 @@
+import copy
 from pathlib import Path
 
 import pytest
 
 from cv import load_cv
-from render import (UNDERFILL_BELOW, attachment_name, build_html, output_path,
+from render import (FILL_TARGET, RenderResult, UNDERFILL_BELOW, fit_to_page, attachment_name, build_html, output_path,
                     render_pdf)
 
 # cv_tailor.yaml (Task 2), not cv_sample.yaml: these tests slice two experience entries and two
@@ -209,3 +210,162 @@ def test_attachment_name_survives_punctuation_and_length():
     assert name == "Ronak_Patel_Resume_Goldman_Sachs_Co_SWE_Intern_Summer_2027.pdf"
     long_name = attachment_name("A B", "C" * 200, "D" * 200)
     assert len(long_name) <= 124 and long_name.endswith(".pdf")
+
+
+# --- fit_to_page ----------------------------------------------------------------------------
+
+def _sized_render(weights=None, capacity=10.0):
+    """Stands in for WeasyPrint. Each bullet occupies `weight / capacity` of a page (default
+    weight 1), so a test controls exactly what fits. Records every selection it renders."""
+    weights = weights or {}
+
+    def render(cv, selection, out_path):
+        used = sum(weights.get(b, 1.0) for s in ("experience", "projects")
+                   for item in selection.get(s) or [] for b in item["bullets"])
+        render.calls.append(copy.deepcopy(selection))
+        fill = used / capacity
+        return RenderResult(out_path, 2 if fill > 1 else 1, min(fill, 1.0))
+
+    render.calls = []
+    return render
+
+
+def _bullets(sel, section):
+    return [b for item in sel.get(section) or [] for b in item["bullets"]]
+
+
+def _all_selected(cv, n_projects=None):
+    projects = cv.projects if n_projects is None else cv.projects[:n_projects]
+    return {
+        "experience": [{"id": e.id, "bullets": [b.id for b in e.bullets]} for e in cv.experience],
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in projects],
+        "skills": {},
+    }
+
+
+def test_an_overflowing_resume_is_trimmed_to_one_page(cv, tmp_path):
+    sel = _all_selected(cv)
+    total = len(_bullets(sel, "experience")) + len(_bullets(sel, "projects"))
+    render = _sized_render(capacity=total - 3)
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=render)
+    assert result.pages == 1
+    kept = len(_bullets(result.selection, "experience")) + len(_bullets(result.selection, "projects"))
+    assert kept == total - 3
+
+
+def test_trimming_takes_projects_before_experience(cv, tmp_path):
+    sel = _all_selected(cv)
+    experience_before = _bullets(sel, "experience")
+    total = len(experience_before) + len(_bullets(sel, "projects"))
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=total - 2))
+    assert _bullets(result.selection, "experience") == experience_before
+
+
+def test_trimming_works_from_the_last_entry_up(cv, tmp_path):
+    # The model's order is its relevance ranking, so the last project is the first to give.
+    sel = _all_selected(cv, n_projects=2)
+    first, last = sel["projects"][0], sel["projects"][1]
+    total = len(_bullets(sel, "experience")) + len(_bullets(sel, "projects"))
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=total - 1))
+    assert result.selection["projects"][0] == first                      # untouched
+    assert result.selection["projects"][1]["bullets"] == last["bullets"][:-1]
+
+
+def test_an_entry_down_to_one_bullet_is_dropped_whole(cv, tmp_path):
+    sel = _all_selected(cv, n_projects=2)
+    sel["projects"][1]["bullets"] = sel["projects"][1]["bullets"][:1]
+    dropped = sel["projects"][1]["id"]
+    total = len(_bullets(sel, "experience")) + len(_bullets(sel, "projects"))
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=total - 1))
+    assert dropped not in [p["id"] for p in result.selection["projects"]]
+
+
+def test_the_last_experience_entry_is_never_dropped(cv, tmp_path):
+    # Nothing can fit: trimming stops with the last job still on the page and reports overflow.
+    sel = {"experience": [{"id": cv.experience[0].id, "bullets": [cv.experience[0].bullets[0].id]}],
+           "projects": [], "skills": {}}
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=0.5))
+    assert result.overflow is True
+    assert [e["id"] for e in result.selection["experience"]] == [cv.experience[0].id]
+
+
+def test_an_underfilled_resume_gets_the_candidates_own_bullets_back(cv, tmp_path):
+    entry = cv.experience[0]
+    sel = {"experience": [{"id": entry.id, "bullets": [entry.bullets[0].id]}],
+           "projects": [], "skills": {}}
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=3))
+    assert result.fill >= FILL_TARGET
+    added = _bullets(result.selection, "experience")[1:]
+    # Deepen what is shown before adding anything new.
+    assert added == [b.id for b in entry.bullets[1:3]]
+
+
+def test_filling_adds_new_entries_only_after_deepening(cv, tmp_path):
+    entry = cv.experience[0]
+    sel = {"experience": [{"id": entry.id, "bullets": [b.id for b in entry.bullets]}],
+           "projects": [], "skills": {}}
+    capacity = len(entry.bullets) + 1
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=capacity))
+    shown = [e["id"] for e in result.selection["experience"]]
+    assert shown[0] == entry.id and len(shown) == 2       # one new entry, after the first was full
+
+
+def test_a_candidate_that_would_spill_over_is_skipped_for_a_shorter_one(cv, tmp_path):
+    entry = cv.experience[0]
+    long_bullet, short_bullet = entry.bullets[1].id, entry.bullets[2].id
+    sel = {"experience": [{"id": entry.id, "bullets": [entry.bullets[0].id]}],
+           "projects": [], "skills": {}}
+    render = _sized_render(weights={long_bullet: 5.0}, capacity=2.5)
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=render)
+    bullets = _bullets(result.selection, "experience")
+    assert long_bullet not in bullets and short_bullet in bullets
+    assert result.pages == 1
+
+
+def test_the_file_on_disk_holds_the_returned_selection(cv, tmp_path):
+    # When the last attempt was a rejected trial, the accepted selection is rendered again.
+    entry = cv.experience[0]
+    sel = {"experience": [{"id": entry.id, "bullets": [entry.bullets[0].id]}],
+           "projects": [], "skills": {}}
+    weights = {b.id: 5.0 for b in entry.bullets[1:]}
+    weights.update({b.id: 5.0 for e in cv.experience[1:] for b in e.bullets})
+    weights.update({b.id: 5.0 for p in cv.projects for b in p.bullets})
+    render = _sized_render(weights=weights, capacity=2.0)
+    result = fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=render)
+    assert render.calls[-1] == result.selection
+
+
+def test_fitting_stops_once_the_target_is_reached(cv, tmp_path):
+    sel = _all_selected(cv)
+    total = len(_bullets(sel, "experience")) + len(_bullets(sel, "projects"))
+    render = _sized_render(capacity=total / 0.95)          # already 95% full
+    fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=render)
+    assert len(render.calls) == 1
+
+
+def test_fitting_is_bounded(cv, tmp_path):
+    from render import MAX_FIT_RENDERS
+    sel = {"experience": [{"id": cv.experience[0].id, "bullets": [cv.experience[0].bullets[0].id]}],
+           "projects": [], "skills": {}}
+    render = _sized_render(capacity=1000)                  # nothing will ever fill it
+    fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=render)
+    assert len(render.calls) <= MAX_FIT_RENDERS + 1
+
+
+def test_fitting_does_not_mutate_the_callers_selection(cv, tmp_path):
+    sel = _all_selected(cv)
+    snapshot = copy.deepcopy(sel)
+    total = len(_bullets(sel, "experience")) + len(_bullets(sel, "projects"))
+    fit_to_page(cv, sel, str(tmp_path / "r.pdf"), render=_sized_render(capacity=total - 4))
+    assert sel == snapshot
+
+
+def test_fitting_with_the_real_renderer_produces_one_page(cv, tmp_path):
+    fat = {
+        "experience": [{"id": e.id, "bullets": [b.id for b in e.bullets]} for e in cv.experience] * 4,
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in cv.projects] * 4,
+        "skills": cv.skills,
+    }
+    result = fit_to_page(cv, fat, str(tmp_path / "r.pdf"))
+    assert result.pages == 1
+    assert Path(result.path).read_bytes().startswith(b"%PDF")
