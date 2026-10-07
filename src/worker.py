@@ -1,6 +1,7 @@
 import logging
 import time
 from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -96,6 +97,7 @@ class Worker:
         send: Callable[..., DeliveryResult] = send_message,
         fetch: Callable[[str], FetchResult] = fetch_description,
         now: Callable[[], datetime] = utcnow,
+        concurrency: int = 1,
     ) -> None:
         self._sessions = session_factory
         self._users = {u.id: u for u in users}
@@ -118,6 +120,13 @@ class Worker:
         self._invalid_streak = 0   # consecutive "invalid" LLM replies; a run of them is a model/schema problem
         self._tailor_invalid_streak = 0   # own counter — never shared with score()'s _invalid_streak
         self._unavailable_streak: dict[str, int] = {}   # alias -> consecutive unavailable replies
+        # LLM calls in flight when concurrency > 1. Only the HTTP call leaves this thread: the
+        # lease is committed before submission and the result written when the loop harvests
+        # the finished call, so every database write stays here, in its own session. With
+        # concurrency 1 there is no pool and the call completes inside run_once, as before.
+        self._concurrency = max(1, concurrency)
+        self._pool = ThreadPoolExecutor(self._concurrency, thread_name_prefix="llm") if concurrency > 1 else None
+        self._inflight: dict[int, tuple[Future, str]] = {}   # ev.id -> (future, stage)
         # name -> resume time, or None for "until restart". Cleared by construction.
         self.paused: dict[str, datetime | None] = {}
 
@@ -154,12 +163,21 @@ class Worker:
     def _pause_unavailable(self, client, after: datetime, why: str) -> datetime:
         """Pause this model's alias for the streak's step and return when it resumes."""
         alias = self._model_name(client)
+        if self.is_paused(f"llm:{alias}") and self.paused[f"llm:{alias}"] is not None:
+            # Already paused: this reply came from a call that was in flight when the first
+            # one failed. Same incident, same pause — it must not climb the ladder.
+            return self.paused[f"llm:{alias}"]
         streak = self._unavailable_streak.get(alias, 0) + 1
         self._unavailable_streak[alias] = streak
         step = UNAVAILABLE_PAUSE_SECONDS[min(streak, len(UNAVAILABLE_PAUSE_SECONDS)) - 1]
         resume = after + timedelta(seconds=step)
         self._pause(f"llm:{alias}", resume, why)
         return resume
+
+    def _not_inflight(self):
+        """A row whose call is in flight must not be picked again when its lease runs out — a
+        36-second call outlives the 30-second first lease."""
+        return Evaluation.id.notin_(list(self._inflight)) if self._inflight else True
 
     def _llm_paused(self, client) -> bool:
         # "llm" is the endpoint (a 429/5xx holds both stages); "llm:<alias>" is one bad model or key.
@@ -221,7 +239,19 @@ class Worker:
                 log.exception("Worker iteration failed")
                 did_work = False
             if not did_work:
-                time.sleep(idle_sleep)
+                self._idle(idle_sleep)
+
+    def _idle(self, seconds: float) -> None:
+        """Nothing to do right now. With calls in flight, wake as soon as one finishes."""
+        if self._inflight:
+            wait([f for f, _ in self._inflight.values()], timeout=seconds, return_when="FIRST_COMPLETED")
+        else:
+            time.sleep(seconds)
+
+    def wait_inflight(self, timeout: float | None = None) -> None:
+        """Block until every in-flight call has returned (the results still await a run_once)."""
+        if self._inflight:
+            wait([f for f, _ in self._inflight.values()], timeout=timeout)
 
     def run_once(self) -> bool:
         # Ready messages first (private results, then the public feed slot — one HTTP call,
@@ -229,6 +259,8 @@ class Worker:
         # local CPU, then the LLM stages. Tailoring goes before scoring: a match is one call
         # from its resume, and finishing it beats starting another posting — with scoring
         # first, the first match of a batch waited for the whole batch to be scored.
+        if self._harvest():
+            return True
         with self._sessions() as session:
             ev = self._next_deliverable(session)
             if ev is not None:
@@ -250,6 +282,8 @@ class Worker:
                 self.render(session, ev)
                 session.commit()
                 return True
+            if self._pool is not None:
+                return self._submit_next(session)
             ev = self._next_tailorable(session)
             if ev is not None:
                 self.tailor(session, ev)
@@ -261,6 +295,48 @@ class Worker:
                 session.commit()
                 return True
             return False
+
+    # -- LLM calls in flight ------------------------------------------------------
+
+    def _submit_next(self, session: Session) -> bool:
+        """Lease the next LLM-stage row and hand its call to the pool. One row per tick."""
+        if len(self._inflight) >= self._concurrency:
+            return False
+        for pick, begin, stage in ((self._next_tailorable, self._begin_tailor, STAGE_TAILOR),
+                                   (self._next_scoreable, self._begin_score, STAGE_SCORE)):
+            ev = pick(session)
+            if ev is None:
+                continue
+            call = begin(session, ev)
+            session.commit()
+            if call is not None:     # None: the row was given up or parked without a call
+                self._inflight[ev.id] = (self._pool.submit(call), stage)
+            return True
+        return False
+
+    def _harvest(self) -> bool:
+        """Write the results of finished calls, each in a session of its own."""
+        done = [(ev_id, f, stage) for ev_id, (f, stage) in self._inflight.items() if f.done()]
+        for ev_id, future, stage in done:
+            del self._inflight[ev_id]
+            finish = self._finish_tailor if stage == STAGE_TAILOR else self._finish_score
+            with self._sessions() as session:
+                ev = session.get(Evaluation, ev_id)
+                if ev is not None:
+                    finish(session, ev, future.result(), self._now())
+                    session.commit()
+        return bool(done)
+
+    @staticmethod
+    def _guarded(fn: Callable[[], LLMResult], ev_id: int, what: str) -> Callable[[], LLMResult]:
+        """A client bug is a failed attempt, not a dead worker — in a pool thread or inline."""
+        def call() -> LLMResult:
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001
+                log.exception("%s raised for evaluation %d", what, ev_id)
+                return LLMResult("transient", None, f"{type(e).__name__}: {e}", None, None, None, 0)
+        return call
 
     def _next_fetchable(self, session: Session) -> Job | None:
         now = self._now()
@@ -347,7 +423,8 @@ class Worker:
         candidates = (
             session.query(Evaluation)
             .join(Job)
-            .filter(Evaluation.stage == STAGE_SCORE, Evaluation.next_attempt_at <= now, Job.fetch_status == FETCH_OK)
+            .filter(Evaluation.stage == STAGE_SCORE, Evaluation.next_attempt_at <= now, Job.fetch_status == FETCH_OK,
+                    self._not_inflight())
             .order_by(Evaluation.next_attempt_at, Evaluation.id)
             .all()
         )
@@ -420,16 +497,23 @@ class Worker:
     # -- score stage --------------------------------------------------------
 
     def score(self, session: Session, ev: Evaluation) -> None:
+        """Serial path: lease, call, write — all inside this tick."""
+        call = self._begin_score(session, ev)
+        if call is not None:
+            self._finish_score(session, ev, call(), self._now())
+
+    def _begin_score(self, session: Session, ev: Evaluation) -> Callable[[], LLMResult] | None:
+        """Validate, lease and commit; return the call to make, or None if the row is parked."""
         user = self._users.get(ev.user_id)
         if user is None or ev.user_id not in self._cvs:
             self._pause(f"discord:{ev.user_id}", None, f"user {ev.user_id!r} not in users.yaml / no CV loaded")
-            return
+            return None
 
         now = self._now()
         if ev.attempts >= SCORE_BUDGET:
             # Crashed attempts can leave the row at the budget with no result: no further call.
             self._give_up_scoring(ev, now, f"budget exhausted after {ev.attempts} attempts")
-            return
+            return None
         if ev.cv_snapshot is None:
             ev.cv_snapshot = self._cvs[ev.user_id]
         try:
@@ -437,20 +521,19 @@ class Worker:
         except ValidationError as e:
             # A hand-edited or pre-schema snapshot: no call would be meaningful, and no lease is owed.
             self._give_up_scoring(ev, now, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:300]}")
-            return
+            return None
         # Lease the attempt before the (slow, crash-prone) call, like fetch.
         ev.attempts += 1
         ev.next_attempt_at = now + timedelta(seconds=backoff(ev.attempts))
         session.commit()
 
         description = (ev.job.description or "")[:DESCRIPTION_CAP]
-        try:
-            result = self._llm.score(description, cv_text)
-        except Exception as e:  # noqa: BLE001 — a client bug is a failed attempt, not a dead worker
-            log.exception("LLM client raised for evaluation %d", ev.id)
-            result = LLMResult("transient", None, f"{type(e).__name__}: {e}", None, None, None, 0)
-        after = self._now()   # deadlines below are measured from when the call came back
+        return self._guarded(lambda: self._llm.score(description, cv_text), ev.id, "LLM client")
 
+    def _finish_score(self, session: Session, ev: Evaluation, result: LLMResult, after: datetime) -> None:
+        """Write the outcome of a scoring call. `after` is when the call came back: every
+        deadline below counts from it, not from when the call was made."""
+        user = self._users[ev.user_id]
         usage = result.usage or {}
         outcome = self._score_outcome(result, user)
         log.info("score ev=%d user=%s model=%s outcome=%s score=%s ms=%d tokens=%s/%s%s",
@@ -594,7 +677,7 @@ class Worker:
         now = self._now()
         candidates = (
             session.query(Evaluation)
-            .filter(Evaluation.stage == STAGE_TAILOR, Evaluation.next_attempt_at <= now)
+            .filter(Evaluation.stage == STAGE_TAILOR, Evaluation.next_attempt_at <= now, self._not_inflight())
             .order_by(Evaluation.next_attempt_at, Evaluation.id)
             .all()
         )
@@ -604,29 +687,32 @@ class Worker:
         return None
 
     def tailor(self, session: Session, ev: Evaluation) -> None:
+        """Serial path: lease, call, write — all inside this tick."""
+        call = self._begin_tailor(session, ev)
+        if call is not None:
+            self._finish_tailor(session, ev, call(), self._now())
+
+    def _begin_tailor(self, session: Session, ev: Evaluation) -> Callable[[], LLMResult] | None:
         now = self._now()
         if ev.attempts >= TAILOR_BUDGET:
             # Crashed attempts can leave the row at the budget with no selection: no further call.
             self._give_up_resume(ev, now, f"tailor budget exhausted after {ev.attempts} attempts")
-            return
+            return None
         try:
             cv = MasterCV.model_validate(ev.cv_snapshot)
         except ValidationError as e:
             self._give_up_resume(ev, now, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:200]}")
-            return
+            return None
 
         ev.attempts += 1
         ev.next_attempt_at = now + timedelta(seconds=backoff(ev.attempts))
         session.commit()        # lease before the slow call, exactly as score and fetch do
 
-        try:
-            result = self._tailor.tailor((ev.job.description or "")[:DESCRIPTION_CAP],
-                                         cv_to_id_text(cv), self._max_bullets)
-        except Exception as e:  # noqa: BLE001 — a client bug is a failed attempt, not a dead worker
-            log.exception("Tailor client raised for evaluation %d", ev.id)
-            result = LLMResult("transient", None, f"{type(e).__name__}: {e}", None, None, None, 0)
-        after = self._now()
+        description, id_text = (ev.job.description or "")[:DESCRIPTION_CAP], cv_to_id_text(cv)
+        return self._guarded(lambda: self._tailor.tailor(description, id_text, self._max_bullets),
+                             ev.id, "Tailor client")
 
+    def _finish_tailor(self, session: Session, ev: Evaluation, result: LLMResult, after: datetime) -> None:
         log.info("tailor ev=%d user=%s model=%s outcome=%s ms=%d%s",
                  ev.id, ev.user_id, result.model or getattr(self._tailor, "model", "?"),
                  result.kind, result.ms, f" error={result.error}" if result.error else "")
@@ -646,6 +732,11 @@ class Worker:
             self._tailor_invalid_streak = 0
 
         if result.ok:
+            try:
+                cv = MasterCV.model_validate(ev.cv_snapshot)   # the snapshot _begin_tailor validated
+            except ValidationError as e:
+                self._give_up_resume(ev, after, f"cv_snapshot invalid: {type(e).__name__}: {str(e)[:200]}")
+                return
             selection, warnings = validate_selection(cv, result.data.model_dump(), self._max_bullets)
             for w in warnings:
                 log.warning("tailor ev=%d: %s", ev.id, w)

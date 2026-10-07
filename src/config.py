@@ -27,6 +27,7 @@ class Settings:
     max_bullets_per_entry: int
     llm_timeout: int
     build_sha: str = "dev"  # short commit the image was built from; "dev" outside Docker
+    llm_concurrency: int = 1   # score/tailor calls in flight at once; 1 is the serial loop
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -57,4 +58,5 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         max_bullets_per_entry=_positive_int(env, "MAX_BULLETS_PER_ENTRY", 4),
         llm_timeout=int(env.get("LLM_TIMEOUT_SECONDS", "120")),
         build_sha=((env.get("BUILD_SHA") or "").strip() or "dev")[:7],
+        llm_concurrency=_positive_int(env, "LLM_CONCURRENCY", 1),
     )

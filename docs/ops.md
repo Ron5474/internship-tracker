@@ -121,6 +121,32 @@ SELECT score_model, COUNT(*) AS calls,
 FROM evaluations WHERE score_usage IS NOT NULL GROUP BY 1;
 ```
 
+### Calls in flight
+
+Scoring is serial unless `.env` sets `LLM_CONCURRENCY` (default 1). Each call takes about as
+long as the model's reasoning, so a batch of ten postings is ten calls end to end; with
+`LLM_CONCURRENCY=3` it is three or four rounds. The startup line reports it:
+`Scoring with … N call(s) in flight`.
+
+Before raising it, check the endpoint actually serves parallel requests at full speed —
+LiteLLM and the provider both have their own limits. Run a few calls alone, then the same
+calls at once, from inside the container:
+
+```bash
+# one at a time
+docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 3 --variant '{}'
+# three at once (three shells, or `&` them); compare the "ms avg" figures
+for i in 1 2 3; do docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 1 --variant '{}' & done; wait
+```
+
+If the parallel runs take about as long each as a lone one, the endpoint keeps up and
+`LLM_CONCURRENCY=3` is safe; if they take three times longer, it is queueing them and the
+setting buys nothing. Then set it in `.env` and `docker compose up -d`.
+
+Rows with a call in flight look leased in the database (`attempts` bumped, `next_attempt_at`
+30 s out) exactly as a serial call does; a restart mid-call loses the reply and retries the row
+after its backoff, as before.
+
 ### Calibration week
 
 Set `notify_below_threshold: true` for yourself in `users.yaml` and restart. Every scored posting arrives with 🎯 (≥ threshold) or 📉 (below). Read a week of them; when a 📉 should have been a 🎯 or vice versa, note the evaluation id from the log line and the score. Adjust the rubric in `src/prompts.py` or your `threshold`, then set `notify_below_threshold: false`.
