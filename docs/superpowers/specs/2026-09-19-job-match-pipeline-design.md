@@ -84,6 +84,8 @@ Loop forever, one item at a time:
 
 Before an evaluation's first score call, the user's master CV is copied onto the row (`cv_snapshot`). Scoring retries, tailoring and rendering all read the snapshot, never the live file, so editing a CV between stages cannot orphan selected IDs or mix a score from one CV with a resume from another. An edit takes effect for evaluations created after the restart.
 
+**Amended 2026-10-06 — calls in flight.** "One item at a time" held the whole pipeline behind each ~36-second scoring call: ten new postings took six minutes. With `LLM_CONCURRENCY` above 1, up to that many score/tailor calls run at once in a thread pool. Only the HTTP call leaves the worker thread: the row is validated and its attempt leased (committed) before the call is submitted, and the result is written when the loop harvests the finished call — each in a session of its own, on the worker thread, by the same code the serial path uses. A row with a call in flight is excluded from the pickers (its first lease is 30 s, shorter than the call). Unavailable replies that arrive while the model is already paused belong to the same incident and do not climb the pause ladder. `LLM_CONCURRENCY=1` (the default) is the original serial loop, unchanged.
+
 ### Paused services and destinations
 
 The worker keeps an in-memory map `paused: {name: resume_at | None}`:

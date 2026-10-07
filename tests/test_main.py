@@ -378,6 +378,17 @@ def test_build_constructs_both_clients_with_their_own_models(tmp_path, monkeypat
     assert worker._tailor.model == "pro"
     assert worker._max_bullets == 3
     assert worker._output_dir == str(tmp_path / "output")
+    assert worker._pool is None                       # LLM_CONCURRENCY unset: serial, as before
+
+
+def test_build_passes_the_llm_concurrency_to_the_worker(tmp_path):
+    _write_users_and_cv(tmp_path)
+    settings = load_settings({
+        "DATA_DIR": str(tmp_path), "LLM_BASE_URL": "http://x/v1",
+        "LLM_SCORE_MODEL": "flash", "LLM_TAILOR_MODEL": "pro", "LLM_CONCURRENCY": "3",
+    })
+    _, worker = build(settings, load_users(str(tmp_path / "users.yaml")))
+    assert worker._concurrency == 3 and worker._pool is not None
 
 
 def test_a_posting_reaches_the_feed_and_the_match_reaches_the_private_channel(tmp_path, session_factory, monkeypatch):

@@ -74,10 +74,12 @@ def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] 
         tailor = LLMClient(settings.llm_base_url, settings.llm_api_key,
                            settings.llm_tailor_model, settings.llm_timeout)
     output_dir = os.path.join(settings.data_dir, "output")
-    log.info("Scoring with %s, tailoring with %s at %s",
-             settings.llm_score_model, settings.llm_tailor_model, settings.llm_base_url)
+    log.info("Scoring with %s, tailoring with %s at %s, %d call(s) in flight",
+             settings.llm_score_model, settings.llm_tailor_model, settings.llm_base_url,
+             settings.llm_concurrency)
     return session_factory, Worker(session_factory, users, cvs=cvs, llm=llm, tailor=tailor,
-                                   output_dir=output_dir, max_bullets=settings.max_bullets_per_entry)
+                                   output_dir=output_dir, max_bullets=settings.max_bullets_per_entry,
+                                   concurrency=settings.llm_concurrency)
 
 
 def poll_all(session_factory, users: list[User], settings: Settings) -> None:
