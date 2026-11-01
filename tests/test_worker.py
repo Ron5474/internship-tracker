@@ -1677,6 +1677,70 @@ def test_two_channels_resolve_to_their_own_webhooks(session_factory, session, cl
     assert sorted(call[0] for call in sender.calls) == sorted([interns, fulltime])
 
 
+# --- resume cutoff (tailor_threshold) --------------------------------------------
+
+RON_CUTOFF = User(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"],
+                  sections=["software"], threshold=60, tailor_threshold=75)
+
+
+def test_a_match_below_the_resume_cutoff_skips_tailoring(session_factory, session, clock, tmp_path):
+    ev = _seed_scoreable(session, "ron")
+    tailor = FakeTailor()
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(70)), tailor, clock, tmp_path, users=(RON_CUTOFF,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.outcome == "matched"
+    assert ev.stage == STAGE_DELIVER
+    assert tailor.calls == []
+
+
+def test_a_match_at_the_resume_cutoff_is_tailored(session_factory, session, clock, tmp_path):
+    ev = _seed_scoreable(session, "ron")
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(75)), FakeTailor(), clock, tmp_path, users=(RON_CUTOFF,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
+
+
+def test_message_for_a_match_below_the_cutoff_says_why_there_is_no_resume(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=70, outcome="matched")
+    msg = message_for(ev, tailor_threshold=75)
+    assert msg.startswith("🎯 70%")
+    assert "below your resume cutoff" in msg
+    assert "Couldn't generate resume" not in msg
+
+
+def test_message_for_a_match_at_the_cutoff_has_no_cutoff_note(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=80, outcome="matched", pdf_path="/x/r.pdf")
+    assert "resume cutoff" not in message_for(ev, tailor_threshold=75)
+
+
+def test_delivery_of_a_match_below_the_cutoff_carries_the_note(session_factory, session, clock):
+    _resolve(session, _seed(session, "ron", stage=STAGE_DELIVER, score=70, outcome="matched"))
+    sender = FakeSender()
+    _worker(session_factory, sender, clock, users=(RON_CUTOFF,)).run_once()
+    assert "below your resume cutoff" in sender.calls[0][1]
+
+
+def test_score_log_line_carries_the_decision_detail(session_factory, session, clock, caplog):
+    _seed_scoreable(session, "ron")
+    ok = _llm_ok(70)
+    detailed = LLMResult(ok.kind, ok.data, None, None, "jev-1.14.0", ok.usage, 5, "tech=0.98 fit=2.80/4")
+    with caplog.at_level("INFO"):
+        _worker_s(session_factory, FakeLLM(detailed), clock).run_once()
+    assert "tech=0.98 fit=2.80/4" in caplog.text
+
+
+def test_a_rescored_match_below_the_cutoff_drops_the_previous_resume(session_factory, session, clock, tmp_path):
+    # docs/ops.md's re-score path can leave a previous run's selection and PDF on the row.
+    ev = _seed_scoreable(session, "ron", tailored={"experience": []}, pdf_path="/old/r.pdf", page_overflow=True)
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(70)), FakeTailor(), clock, tmp_path, users=(RON_CUTOFF,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER
+    assert ev.pdf_path is None and ev.tailored is None and ev.page_overflow is False
+
+
 def test_render_stores_the_fitted_selection(session_factory, session, clock, tmp_path):
     """What was rendered is what gets stored, so a re-render reproduces the same page."""
     from render import RenderResult

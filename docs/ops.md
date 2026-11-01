@@ -101,7 +101,15 @@ Rows already delivered "(couldn't score)" are `closed` and cannot be recovered �
 
 ## Scoring
 
-Per-attempt log line: `score ev=<id> user=<id> model=<m> outcome=<matched|below_threshold|unusable|transient|unavailable|invalid> score=<n|-> ms=<t> tokens=<in>/<out>`.
+Scoring runs on a decision model (TypeSafe Jev), sent to LiteLLM's `{LLM_BASE_URL}/decisions` route with `model=LLM_SCORE_MODEL`. Jev answers three questions against the posting plus CV and writes no text:
+
+- `is_tech_role` (predicate): below 0.5 caps the score at 40, the same discipline gate the chat rubric had.
+- `fit` (score, five levels `poor`…`strong`): mapped to 0–100 as `fit / 4 × 100`, so `good` = 75 and `partial` = 50.
+- `is_posting` (predicate): below 0.5 is `unusable` and delivered link-only.
+
+`reasoning` and the gap lists stay empty, so the 🎯/📉 message carries company, role, location, link, score and resume only. The question wording and fit levels live in `src/prompts.py` (`DECISION_*`); `SCORE_SYSTEM` there is now used only by `scripts/ab_score.py`, which still compares chat models.
+
+Per-attempt log line: `score ev=<id> user=<id> model=<m> outcome=<matched|below_threshold|unusable|transient|unavailable|invalid> score=<n|-> ms=<t> tokens=<in>/<out> tech=<p> fit=<f>/4 conf=<c> posting=<p>`. The Jev fields are the raw answers, and they are only in the log, not the database — grep them during calibration. A low `conf` means the fit was split across levels.
 
 Score distribution and outcomes (last 7 days):
 
@@ -116,9 +124,25 @@ Token spend by model:
 
 ```sql
 SELECT score_model, COUNT(*) AS calls,
-       SUM(json_extract(score_usage, '$.prompt_tokens'))     AS prompt_tokens,
-       SUM(json_extract(score_usage, '$.completion_tokens')) AS completion_tokens
+       -- chat models report prompt/completion tokens; Jev reports input/output tokens
+       SUM(COALESCE(json_extract(score_usage, '$.prompt_tokens'),
+                    json_extract(score_usage, '$.input_tokens')))      AS input_tokens,
+       SUM(COALESCE(json_extract(score_usage, '$.completion_tokens'),
+                    json_extract(score_usage, '$.output_tokens')))     AS output_tokens
 FROM evaluations WHERE score_usage IS NOT NULL GROUP BY 1;
+```
+
+### Resume cutoff
+
+`tailor_threshold` (per user, in `users.yaml`) decides which matches get a tailored resume from `LLM_TAILOR_MODEL`. A match at or above it is tailored and rendered as before. A match between `threshold` and `tailor_threshold` is still delivered as 🎯, with "📄 No resume — below your resume cutoff" and no pro call. Unset, it equals `threshold`, so every match is tailored. It must not be below `threshold`; loading `users.yaml` fails if it is.
+
+The cutoff is read at scoring time: changing it affects rows scored afterwards, not ones already queued for tailoring.
+
+```sql
+-- matches by score band, to pick a cutoff
+SELECT (score / 5) * 5 AS band, COUNT(*) AS matches,
+       SUM(pdf_path IS NOT NULL) AS with_pdf
+FROM evaluations WHERE outcome = 'matched' GROUP BY 1 ORDER BY 1 DESC;
 ```
 
 ### Calls in flight
@@ -127,6 +151,10 @@ Scoring is serial unless `.env` sets `LLM_CONCURRENCY` (default 1). Each call ta
 long as the model's reasoning, so a batch of ten postings is ten calls end to end; with
 `LLM_CONCURRENCY=3` it is three or four rounds. The startup line reports it:
 `Scoring with … N call(s) in flight`.
+
+With Jev scoring, a score call takes a fraction of a second, so this mostly matters for the
+tailor calls on `LLM_TAILOR_MODEL`. The `ab_score.py` check below times the chat scoring path,
+so treat it as a rough read on the endpoint, not a measure of Jev.
 
 Before raising it, check the endpoint actually serves parallel requests at full speed —
 LiteLLM and the provider both have their own limits. Run a few calls alone, then the same
@@ -192,6 +220,18 @@ do not. Guarded by `tests/test_prompts.py`.
 
 Watch the next batch for the opposite error — a real data or ML posting pushed under 40 by the
 gate. If that happens the category list is too broad, not the ceiling.
+
+## Deploying Jev scoring
+
+The old image cannot score with a Jev alias (it calls `/chat/completions`), and the new image cannot score with a chat alias (it calls `/decisions`). Switch the config and the image together:
+
+1. Leave `notify_below_threshold: true` on while Jev's scale settles — its 0–100 is not flash's, so the old `threshold` is a starting point, not a calibrated value.
+2. In `~/deployed-projects/internship-tracker/.env`, set `LLM_API_KEY` to the new key (it covers both Jev and `deepseek-v4-pro`) and `LLM_SCORE_MODEL` to the Jev alias.
+3. Straight after, `docker compose pull && docker compose up -d`.
+4. Watch for the first lines: `docker compose logs -f internship-tracker | grep -E "score ev=|Pausing|ERROR"`. Expect `outcome=matched`/`below_threshold` with `tech=… fit=…` on the end. `outcome=invalid` with `HTTP 400` means LiteLLM rejected the request — read `error=`; an input-length complaint would mean the posting plus CV exceeds Jev's limit.
+5. After a week, set `threshold` from what the 🎯/📉 split looked like, then raise `tailor_threshold` to where you stop downloading the resume.
+
+Rolling back to a pre-Jev image needs `LLM_SCORE_MODEL` back on a chat alias (`deepseek-v4-flash`). `tailor_threshold` would then make the old image refuse to start (`extra="forbid"`), so remove it from `users.yaml` too.
 
 ## Deploying Plan 4
 

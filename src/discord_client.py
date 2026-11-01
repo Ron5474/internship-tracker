@@ -11,6 +11,7 @@ _ELLIPSIS = "…"
 OVERFLOW_NOTE = "📄 Resume ran over one page — trim before sending"
 UNDERFILL_NOTE = "📏 Resume fills only {pct}% of the page — room for another project"
 NO_RESUME_NOTE = "⚠️ Couldn't generate resume — apply with your master CV."
+CUTOFF_NOTE = "📄 No resume — below your resume cutoff"
 
 
 @dataclass(frozen=True)
@@ -35,7 +36,7 @@ def format_match(
     company: str, role: str, location: str, url: str,
     score: int, reasoning: str, missing_confirmed: list[str], missing_unknown: list[str],
     matched: bool, overflow: bool = False, resume_missing: bool = False,
-    underfill: int | None = None,
+    underfill: int | None = None, below_cutoff: bool = False,
 ) -> str:
     icon = "🎯" if matched else "📉"
     header = f"{icon} {score}% — **{company}** — {role}\n📍 {location}\n🔗 {url}"
@@ -47,6 +48,8 @@ def format_match(
         lists.append("❓ Not on CV: " + ", ".join(missing_unknown))
 
     notes = []
+    if below_cutoff:
+        notes.append(CUTOFF_NOTE)
     if resume_missing:
         notes.append(NO_RESUME_NOTE)
     if overflow:

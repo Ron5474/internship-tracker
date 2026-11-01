@@ -444,3 +444,15 @@ def test_a_feeds_only_user_is_reported_as_public(caplog):
     private_part, public_part = caplog.text.split("single public webhook:")
     assert "cousin" not in private_part
     assert "cousin" in public_part
+
+
+def test_build_scores_with_the_decision_client_and_tailors_with_chat(tmp_path):
+    from llm import DecisionClient, LLMClient
+    _write_users_and_cv(tmp_path)
+    settings = load_settings({
+        "DATA_DIR": str(tmp_path), "LLM_BASE_URL": "http://x/v1",
+        "LLM_SCORE_MODEL": "jev", "LLM_TAILOR_MODEL": "pro",
+    })
+    _, worker = build(settings, load_users(str(tmp_path / "users.yaml")))
+    assert isinstance(worker._llm, DecisionClient)
+    assert isinstance(worker._tailor, LLMClient)

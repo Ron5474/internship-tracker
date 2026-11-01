@@ -215,3 +215,24 @@ def test_a_feed_channel_may_not_be_the_results_channel():
 def test_an_empty_feed_channel_url_is_rejected():
     with pytest.raises(ValidationError):
         _split_user(discord_webhook_feeds={"internships": ""})
+
+
+# --- tailor_threshold ----------------------------------------------------------
+
+def _tt_user(**kw):
+    base = dict(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships"], sections=["software"])
+    return User(**{**base, **kw})
+
+
+def test_tailor_threshold_defaults_to_threshold():
+    assert _tt_user(threshold=65).tailor_threshold == 65
+
+
+def test_tailor_threshold_can_sit_above_threshold():
+    assert _tt_user(threshold=60, tailor_threshold=75).tailor_threshold == 75
+
+
+def test_tailor_threshold_below_threshold_is_rejected():
+    # Every match below it would skip the resume anyway, so a lower value can only be a typo.
+    with pytest.raises(ValidationError, match="tailor_threshold"):
+        _tt_user(threshold=60, tailor_threshold=50)

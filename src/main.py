@@ -10,7 +10,7 @@ from config import FEEDS, Settings, load_settings
 from cv import load_cv
 from db import ensure_columns, ensure_feeds, import_legacy_state, init_db, make_engine, make_session_factory
 from github_client import get_latest_sha, get_readme_content
-from llm import LLMClient
+from llm import DecisionClient, LLMClient
 from migration import migrate_state
 from poller import poll_feed
 from users import User, load_users
@@ -69,7 +69,9 @@ def build(settings: Settings, users: list[User], llm=None, cvs: dict[str, dict] 
     if cvs is None:
         cvs = load_cvs(users)
     if llm is None:
-        llm = LLMClient(settings.llm_base_url, settings.llm_api_key, settings.llm_score_model, settings.llm_timeout)
+        # Scoring runs on a decision model (Jev) via LiteLLM's /decisions route; tailoring stays on chat.
+        llm = DecisionClient(settings.llm_base_url, settings.llm_api_key, settings.llm_score_model,
+                             settings.llm_timeout)
     if tailor is None:
         tailor = LLMClient(settings.llm_base_url, settings.llm_api_key,
                            settings.llm_tailor_model, settings.llm_timeout)

@@ -66,7 +66,13 @@ def _underfill(ev: Evaluation) -> int | None:
     return ev.page_fill if ev.page_fill < UNDERFILL_BELOW * 100 else None
 
 
-def message_for(ev: Evaluation) -> str:
+def _below_cutoff(ev: Evaluation, tailor_threshold: int | None) -> bool:
+    """A match that was never tailored because it scored under the user's resume cutoff."""
+    return (tailor_threshold is not None and ev.outcome == "matched" and ev.pdf_path is None
+            and ev.resume_error is None and ev.score is not None and ev.score < tailor_threshold)
+
+
+def message_for(ev: Evaluation, tailor_threshold: int | None = None) -> str:
     job = ev.job
     if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
         return format_match(
@@ -79,6 +85,7 @@ def message_for(ev: Evaluation) -> str:
             # Only a match promises a resume; a below-threshold notice never had one.
             resume_missing=ev.outcome == "matched" and ev.pdf_path is None and ev.resume_error is not None,
             underfill=_underfill(ev),
+            below_cutoff=_below_cutoff(ev, tailor_threshold),
         )
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
@@ -536,10 +543,12 @@ class Worker:
         user = self._users[ev.user_id]
         usage = result.usage or {}
         outcome = self._score_outcome(result, user)
-        log.info("score ev=%d user=%s model=%s outcome=%s score=%s ms=%d tokens=%s/%s%s",
+        log.info("score ev=%d user=%s model=%s outcome=%s score=%s ms=%d tokens=%s/%s%s%s",
                  ev.id, ev.user_id, result.model or self._model_name(self._llm), outcome,
                  result.data.score if outcome in ("matched", "below_threshold") else "-", result.ms,
-                 usage.get("prompt_tokens", "?"), usage.get("completion_tokens", "?"),
+                 usage.get("prompt_tokens", usage.get("input_tokens", "?")),
+                 usage.get("completion_tokens", usage.get("output_tokens", "?")),
+                 f" {result.detail}" if result.detail else "",
                  f" error={result.error}" if result.error else "")
 
         if result.kind != "unavailable":
@@ -566,7 +575,13 @@ class Worker:
             ev.last_error = None
             if data.score >= user.threshold:
                 ev.outcome = "matched"
-                ev.stage = STAGE_TAILOR if self._tailoring_enabled else STAGE_DELIVER
+                # Under the resume cutoff the match is still delivered, just without the pricier
+                # tailor call; message_for() says why there is no PDF.
+                tailor = self._tailoring_enabled and data.score >= user.tailor_threshold
+                if self._tailoring_enabled and not tailor:
+                    # Same as below_threshold: a re-scored row must not ship a previous run's PDF.
+                    ev.tailored, ev.pdf_path, ev.page_overflow, ev.resume_error = None, None, False, None
+                ev.stage = STAGE_TAILOR if tailor else STAGE_DELIVER
                 ev.attempts = 0            # the budget belongs to the stage, not the row
             else:
                 ev.outcome = "below_threshold"
@@ -810,7 +825,7 @@ class Worker:
             pdf_path = None
 
         try:
-            result = self._send(user.results_webhook, message_for(ev), pdf_path,
+            result = self._send(user.results_webhook, message_for(ev, user.tailor_threshold), pdf_path,
                                 self._attachment_name(ev) if pdf_path else None)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
             log.exception("Sender raised for evaluation %d", ev.id)
