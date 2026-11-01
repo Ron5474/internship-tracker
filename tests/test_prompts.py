@@ -43,3 +43,14 @@ def test_score_user_message_carries_both_inputs_and_closes_with_the_instruction(
 
 def test_reask_names_the_problem():
     assert "bad key" in reask_message("bad key")
+
+
+def test_jev_tech_question_names_the_disciplines_that_misfired():
+    from prompts import DECISION_TECH_ROLE
+    for discipline in ("records and information management", "survey", "governance", "coordination"):
+        assert discipline in DECISION_TECH_ROLE.lower(), discipline
+
+
+def test_jev_fit_levels_run_lowest_first_in_five_steps():
+    from prompts import DECISION_FIT_LEVELS
+    assert [lvl["label"] for lvl in DECISION_FIT_LEVELS] == ["poor", "weak", "partial", "good", "strong"]

@@ -61,6 +61,53 @@ def score_user_message(description: str, cv_text: str) -> str:
     return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}\n\nReturn the JSON object now."
 
 
+# --- Jev (TypeSafe System One) through LiteLLM's /decisions route --------------------------------
+# SCORE_SYSTEM above is now used only by scripts/ab_score.py; the worker scores with these.
+# Jev answers each question independently against the same input and writes no text, so the
+# rubric lives in the question wording and the fit levels, and the 40-point ceiling for a
+# non-technology role is applied in code (llm.DecisionClient), not by the model.
+
+DECISION_TECH_ROLE = (
+    "The job posting is a technology role: software engineering, data, AI/ML, or cloud/infrastructure "
+    "work whose day-to-day output is code, models, data pipelines, or the systems that run them. "
+    "Analysing data with SQL, Python or notebooks counts. Records and information management, market "
+    "or survey research, policy, compliance or governance work, non-technical business, marketing or "
+    "operations analytics, program and project coordination, and general business internships do not."
+)
+
+DECISION_FIT = (
+    "How well the candidate's CV demonstrates what the job posting requires. Judge only what the CV "
+    "shows against what the posting asks for. A requirement the CV is silent on (work authorization, "
+    "graduation year, security clearance, location, a technology never mentioned) does not lower the fit."
+)
+
+# Lowest first. Five levels map onto 0, 25, 50, 75, 100 — the same bands as SCORE_SYSTEM's rubric.
+DECISION_FIT_LEVELS = [
+    {"label": "poor", "description": "Most hard requirements confirmed missing, or the core skills do not match"},
+    {"label": "weak", "description": "Multiple hard requirements confirmed missing"},
+    {"label": "partial", "description": "One hard requirement confirmed missing, otherwise a fit"},
+    {"label": "good", "description": "Demonstrates the hard requirements; some preferred ones not shown"},
+    {"label": "strong", "description": "Demonstrates every hard requirement and most preferred ones"},
+]
+
+DECISION_IS_POSTING = (
+    "The job posting text is an actual job posting, not an error page, login wall, cookie banner, "
+    "navigation only, or a list of unrelated jobs."
+)
+
+
+def decision_questions() -> list[dict]:
+    return [
+        {"name": "is_tech_role", "type": "predicate", "instructions": DECISION_TECH_ROLE},
+        {"name": "fit", "type": "score", "instructions": DECISION_FIT, "levels": DECISION_FIT_LEVELS},
+        {"name": "is_posting", "type": "predicate", "instructions": DECISION_IS_POSTING},
+    ]
+
+
+def decision_input(description: str, cv_text: str) -> str:
+    return f"JOB POSTING:\n{description}\n\n---\n\nCANDIDATE CV:\n{cv_text}"
+
+
 def reask_message(problem: str) -> str:
     return (f"That reply was not a valid JSON object matching the schema ({problem}). "
             "Reply again with ONLY the JSON object — no prose, no code fences.")

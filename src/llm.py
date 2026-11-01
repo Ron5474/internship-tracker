@@ -6,7 +6,17 @@ from dataclasses import dataclass
 import requests
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from prompts import SCORE_SYSTEM, TAILOR_SYSTEM, reask_message, score_user_message, tailor_user_message
+from prompts import (
+    SCORE_SYSTEM,
+    TAILOR_SYSTEM,
+    decision_input,
+    decision_questions,
+    reask_message,
+    score_user_message,
+    tailor_user_message,
+)
+
+NON_TECH_CEILING = 40
 
 _FENCE = re.compile(r"^\s*```(?:json)?\s*(.*?)\s*```\s*$", re.S)
 
@@ -49,6 +59,7 @@ class LLMResult:
     model: str | None
     usage: dict | None
     ms: int
+    detail: str | None = None   # extra text for the score log line (Jev's raw answers)
 
     @property
     def ok(self) -> bool:
@@ -98,6 +109,98 @@ def _error_message(resp) -> str:
     return (resp.text or "")[:200]
 
 
+def _post(url: str, headers: dict, payload: dict, timeout: int):
+    """One JSON POST. Returns (kind, response, error, retry_after); response is set only when ok."""
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+    except requests.ConnectionError as e:
+        return "unavailable", None, f"{type(e).__name__}: {e}", None
+    except requests.RequestException as e:
+        return "transient", None, f"{type(e).__name__}: {e}", None
+
+    kind = classify_status(resp.status_code)
+    if kind == "ok":
+        return "ok", resp, None, None
+    retry_after = None
+    if resp.status_code == 429:
+        try:
+            retry_after = float(resp.headers.get("Retry-After", ""))
+        except ValueError:
+            retry_after = None
+    return kind, None, f"HTTP {resp.status_code}: {_error_message(resp)}", retry_after
+
+
+def _headers(api_key: str | None) -> dict:
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
+
+
+class DecisionClient:
+    """Scores a posting with a decision model (TypeSafe Jev) on LiteLLM's /decisions route.
+
+    Same `score()` contract as LLMClient, so the worker does not care which one it holds. A
+    decision model returns typed answers instead of text: no JSON to repair, so no re-ask, and
+    no reasoning or gap lists — those fields come back empty and the message omits them.
+    """
+
+    def __init__(self, base_url: str, api_key: str | None, model: str, timeout: int = 120) -> None:
+        self._url = f"{base_url.rstrip('/')}/decisions"
+        self._headers = _headers(api_key)
+        self._model = model
+        self._timeout = timeout
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def score(self, description: str, cv_text: str) -> LLMResult:
+        started = time.monotonic()
+        payload = {"model": self._model, "input": decision_input(description, cv_text),
+                   "questions": decision_questions()}
+        kind, resp, error, retry_after = _post(self._url, self._headers, payload, self._timeout)
+        if kind != "ok":
+            return LLMResult(kind, None, error, retry_after, None, None, LLMClient._ms(started))
+
+        try:
+            body = resp.json()
+            answers = {a.get("name"): a for a in body["answers"]}
+            model, usage = body.get("model"), body.get("usage")
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            return LLMResult("invalid", None, f"unexpected response shape: {type(e).__name__}",
+                             None, None, None, LLMClient._ms(started))
+
+        try:
+            tech = float(self._answer(answers, "is_tech_role", "predicate")["probability"])
+            fit_answer = self._answer(answers, "fit", "score")
+            fit, confidence = float(fit_answer["score"]), fit_answer.get("confidence")
+            posting = float(self._answer(answers, "is_posting", "predicate")["probability"])
+        except (KeyError, TypeError, ValueError) as e:
+            return LLMResult("invalid", None, f"bad decision answer: {e}", None, model, usage,
+                             LLMClient._ms(started))
+
+        top = len(decision_questions()[1]["levels"]) - 1
+        score = max(0, min(100, round(fit / top * 100)))
+        if tech < 0.5:
+            score = min(score, NON_TECH_CEILING)
+        usable = posting >= 0.5
+        data = ScoreResponse(score=score if usable else 0, reasoning="", missing_confirmed=[],
+                             missing_unknown=[], posting_usable=usable)
+        conf = f"{confidence:.2f}" if isinstance(confidence, (int, float)) else "?"
+        detail = f"tech={tech:.2f} fit={fit:.2f}/{top} conf={conf} posting={posting:.2f}"
+        return LLMResult("ok", data, None, None, model, usage, LLMClient._ms(started), detail)
+
+    @staticmethod
+    def _answer(answers: dict, name: str, kind: str) -> dict:
+        answer = answers.get(name)
+        if answer is None:
+            raise KeyError(f"no answer for {name!r}")
+        if answer.get("type") != kind:
+            raise ValueError(f"{name!r} answered as {answer.get('type')!r}, expected {kind!r}")
+        return answer
+
+
 class LLMClient:
     def __init__(self, base_url: str, api_key: str | None, model: str, timeout: int = 120) -> None:
         self._url = f"{base_url.rstrip('/')}/chat/completions"
@@ -139,22 +242,9 @@ class LLMClient:
             "temperature": 0,
             "response_format": {"type": "json_object"},
         }
-        try:
-            resp = requests.post(self._url, headers=self._headers, json=payload, timeout=self._timeout)
-        except requests.ConnectionError as e:
-            return "unavailable", None, f"{type(e).__name__}: {e}", None, None, None
-        except requests.RequestException as e:
-            return "transient", None, f"{type(e).__name__}: {e}", None, None, None
-
-        kind = classify_status(resp.status_code)
+        kind, resp, error, retry_after = _post(self._url, self._headers, payload, self._timeout)
         if kind != "ok":
-            retry_after = None
-            if resp.status_code == 429:
-                try:
-                    retry_after = float(resp.headers.get("Retry-After", ""))
-                except ValueError:
-                    retry_after = None
-            return kind, None, f"HTTP {resp.status_code}: {_error_message(resp)}", retry_after, None, None
+            return kind, None, error, retry_after, None, None
 
         try:
             body = resp.json()

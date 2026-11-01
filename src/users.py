@@ -30,6 +30,9 @@ class User(BaseModel):
     sections: list[str] = Field(min_length=1)
     threshold: int = 60
     notify_below_threshold: bool = False
+    # A match at or above this gets a tailored resume (a call to the pricier tailor model); a
+    # match between `threshold` and this is delivered without one. Unset means `threshold`.
+    tailor_threshold: int | None = None
     # min_length=1 so `discord_webhook_private: ""` fails validation instead of passing as a
     # falsy-but-present string that `results_webhook` would then silently route to the public URL.
     discord_webhook_private: str | None = Field(default=None, min_length=1)
@@ -46,6 +49,15 @@ class User(BaseModel):
         if any(not url for url in mapping.values()):
             raise ValueError("discord_webhook_feeds URLs must not be empty")
         return mapping
+
+    @model_validator(mode="after")
+    def _tailor_threshold_not_below_threshold(self) -> "User":
+        if self.tailor_threshold is None:
+            self.tailor_threshold = self.threshold
+        elif self.tailor_threshold < self.threshold:
+            raise ValueError(f"tailor_threshold ({self.tailor_threshold}) must be at least "
+                             f"threshold ({self.threshold})")
+        return self
 
     @model_validator(mode="after")
     def _destinations_are_distinct(self) -> "User":

@@ -4,6 +4,9 @@
   feeds: [internships, new-grad]
   sections: [software engineering, data science]
   threshold: 60
+  # Optional. Matches scoring at or above this get a tailored resume; matches between
+  # `threshold` and this are still delivered, without one. Defaults to `threshold`.
+  # tailor_threshold: 75
   # Calibration: true delivers below-threshold postings too, with their score, so you can
   # judge the scoring. Set false once you trust it.
   notify_below_threshold: false
