@@ -23,6 +23,12 @@ threshold, average latency, and average reasoning tokens.
 scores move on their own between two identical calls. A variant that drifts less than that
 baseline has not been shown to change anything.
 
+The request is rebuilt with the *current* code, so after a change to the prompt text or layout
+(the CV-before-posting order, say) the `{}` row is no longer a pure repeat: it measures the
+new prompt against scores the old one produced. That is the check to run after deploying such
+a change. The summary also reports cached prompt tokens per call, when the endpoint says — the
+number that should jump once the CV leads the message.
+
 Useful flags:
 
 - `--ids 165,171,177,183` — re-score specific evaluations rather than the most recent ones.

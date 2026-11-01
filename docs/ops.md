@@ -1,5 +1,20 @@
 # Operations notes
 
+## Deploying a merge
+
+Docker Hub gets the image a minute or two after the merge lands on `main` — check the
+Actions tab is green first; a `docker compose pull` run before that quietly keeps the old
+image. Then, on the server:
+
+```bash
+cd ~/deployed-projects/internship-tracker
+docker compose pull && docker compose up -d       # pull alone does not restart
+docker compose logs --since 1m | grep "Tracker starting"
+```
+
+The line reads `Tracker starting (build <sha>)`; the sha is the merge commit's first seven
+characters, which `git log --oneline -1 origin/main` shows. `build dev` means a local build.
+
 ## Fetch success by host (last 7 days)
 
 Run on the server: `sqlite3 data/tracker.db` then
@@ -71,7 +86,7 @@ Expect `200`, and the model alias in `LLM_SCORE_MODEL` must appear in that `/mod
 | --- | --- |
 | `outcome=matched` / `outcome=below_threshold` | healthy |
 | `outcome=invalid` on every row | the model is not honouring the strict schema — read `error=` for the failing field |
-| `outcome=unavailable` and `Pausing llm` every 15 min | URL, key or model alias is wrong; fix `.env` and restart rather than waiting |
+| `outcome=unavailable` and `Pausing llm` repeating (1 min, then 5, then every 15) | URL, key or model alias is wrong; fix `.env` and restart rather than waiting. A single one that does not repeat was a blip (LiteLLM restarting) and clears itself |
 | `Pausing llm (3 consecutive invalid replies…)` | the breaker: three invalid replies in a row, same cause as above |
 | `outcome=unusable` | the model says the fetched text is not a posting; the row is delivered link-only |
 
@@ -105,6 +120,32 @@ SELECT score_model, COUNT(*) AS calls,
        SUM(json_extract(score_usage, '$.completion_tokens')) AS completion_tokens
 FROM evaluations WHERE score_usage IS NOT NULL GROUP BY 1;
 ```
+
+### Calls in flight
+
+Scoring is serial unless `.env` sets `LLM_CONCURRENCY` (default 1). Each call takes about as
+long as the model's reasoning, so a batch of ten postings is ten calls end to end; with
+`LLM_CONCURRENCY=3` it is three or four rounds. The startup line reports it:
+`Scoring with … N call(s) in flight`.
+
+Before raising it, check the endpoint actually serves parallel requests at full speed —
+LiteLLM and the provider both have their own limits. Run a few calls alone, then the same
+calls at once, from inside the container:
+
+```bash
+# one at a time
+docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 3 --variant '{}'
+# three at once (three shells, or `&` them); compare the "ms avg" figures
+for i in 1 2 3; do docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 1 --variant '{}' & done; wait
+```
+
+If the parallel runs take about as long each as a lone one, the endpoint keeps up and
+`LLM_CONCURRENCY=3` is safe; if they take three times longer, it is queueing them and the
+setting buys nothing. Then set it in `.env` and `docker compose up -d`.
+
+Rows with a call in flight look leased in the database (`attempts` bumped, `next_attempt_at`
+30 s out) exactly as a serial call does; a restart mid-call loses the reply and retries the row
+after its backoff, as before.
 
 ### Calibration week
 

@@ -84,6 +84,8 @@ Loop forever, one item at a time:
 
 Before an evaluation's first score call, the user's master CV is copied onto the row (`cv_snapshot`). Scoring retries, tailoring and rendering all read the snapshot, never the live file, so editing a CV between stages cannot orphan selected IDs or mix a score from one CV with a resume from another. An edit takes effect for evaluations created after the restart.
 
+**Amended 2026-10-06 — calls in flight.** "One item at a time" held the whole pipeline behind each ~36-second scoring call: ten new postings took six minutes. With `LLM_CONCURRENCY` above 1, up to that many score/tailor calls run at once in a thread pool. Only the HTTP call leaves the worker thread: the row is validated and its attempt leased (committed) before the call is submitted, and the result is written when the loop harvests the finished call — each in a session of its own, on the worker thread, by the same code the serial path uses. A row with a call in flight is excluded from the pickers (its first lease is 30 s, shorter than the call). Unavailable replies that arrive while the model is already paused belong to the same incident and do not climb the pause ladder. `LLM_CONCURRENCY=1` (the default) is the original serial loop, unchanged.
+
 ### Paused services and destinations
 
 The worker keeps an in-memory map `paused: {name: resume_at | None}`:
@@ -165,7 +167,7 @@ Every external call is classified before deciding what to do:
 | Class | Examples | Handling |
 |---|---|---|
 | Transient | timeout, connection error, 5xx, 429 | Retry with exponential backoff (30 s → 1 min → 5 min → 15 min → 1 h), honoring `Retry-After` when present. Counts against the stage's budget. |
-| Service unavailable | LLM endpoint refuses connections or returns 401/403 | Pause that service: log at ERROR once, set `next_attempt_at` 15 min ahead on the affected row, **do not** increment `attempts`. Queued evaluations wait for the service to come back. |
+| Service unavailable | LLM endpoint refuses connections or returns 401/403 | Pause that service: log at ERROR once, set `next_attempt_at` ahead on the affected row — 1 min for the first unavailable reply, 5 min for the next consecutive one, 15 min from then on (amended 2026-10-06: a flat 15 min turned a seconds-long LiteLLM restart into a quarter-hour stall); any other reply resets the ladder — **do not** increment `attempts`. Queued evaluations wait for the service to come back. |
 | Item invalid | LLM response fails schema validation (after the client's single in-call re-ask), PDF render throws on this input | Counts as one failed attempt against the stage budget. |
 | Item gone | ATS API 404 for this posting | Treated as permanent for the fetch stage: an ATS API 404 means the posting is gone; the link-only fallback still notifies. |
 | Destination gone | Discord webhook returns 404 or 401 | Pause `discord:<user_id>` until restart (see Paused services). Does not count against delivery attempts. |
@@ -295,6 +297,8 @@ The validated selection is stored on the evaluation (`tailored`) so a re-render 
 `render.py`: CV snapshot + validated selection → Jinja2 HTML template → WeasyPrint → `$DATA_DIR/output/<user>/<job_id>-<company>.pdf`. One HTML template and one CSS file shared by all users, styled to resemble the current CV layout.
 
 One page is the target, enforced by measuring the rendered page. **Amended 2026-10-06:** this originally said content caps rather than a trimming loop. In production the same count of bullets landed anywhere from 74% of a page to two pages, because bullets run from one line to three — no fixed cap can absorb that. `render.fit_to_page` now renders, measures and adjusts: over one page it drops the least relevant bullet (projects before experience, the last entry first, an entry dropped whole once down to one bullet, the last experience entry never); under 90% full it adds back the candidate's own unselected bullets, deepening shown entries before adding new ones and skipping any that would spill over. Fonts and margins never change. The fitted selection is stored, so a re-render reproduces it.
+
+**Amended 2026-10-06 (later the same day):** what gets added back is now the model's choice, not the master's order. The tailor prompt asks for every bullet worth showing and every project with some relevance, ranked; `validate_selection` cuts at the caps as before but keeps what fell past them under `reserve` (`[section, entry_id, bullet_id]` rows, model order — spare bullets of shown entries first, then entries that did not make the cut). `fit_to_page` draws on the reserve first and only then on the master's order. The per-entry cap therefore governs the first cut, not the final page: an entry may show a fifth bullet when the model ranked it and the page has room. Rows tailored before this change have no reserve and fill as before.
 
 ## Delivery
 

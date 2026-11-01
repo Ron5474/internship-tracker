@@ -58,11 +58,13 @@ class Row:
 
 
 class Result:
-    def __init__(self, score=None, ms=0, reasoning_tokens=None, completion_tokens=None, error=None):
+    def __init__(self, score=None, ms=0, reasoning_tokens=None, completion_tokens=None, error=None,
+                 cached_tokens=None):
         self.score = score
         self.ms = ms
         self.reasoning_tokens = reasoning_tokens
         self.completion_tokens = completion_tokens
+        self.cached_tokens = cached_tokens      # prompt tokens served from the endpoint's cache
         self.error = error
 
     def cell(self):
@@ -114,6 +116,10 @@ def ask(url: str, headers: dict, model: str, messages: list, overrides: dict, ti
     body = resp.json()
     usage = body.get("usage") or {}
     details = usage.get("completion_tokens_details") or {}
+    # OpenAI-style key as LiteLLM normalises it; DeepSeek's native name as a fallback.
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    if cached is None:
+        cached = usage.get("prompt_cache_hit_tokens")
     try:
         content = body["choices"][0]["message"]["content"]
         parsed = ScoreResponse.model_validate(json.loads(_strip_fence(content)))
@@ -121,7 +127,8 @@ def ask(url: str, headers: dict, model: str, messages: list, overrides: dict, ti
         return Result(ms=ms, error=f"{type(e).__name__}",
                       reasoning_tokens=details.get("reasoning_tokens"),
                       completion_tokens=usage.get("completion_tokens"))
-    return Result(parsed.score, ms, details.get("reasoning_tokens"), usage.get("completion_tokens"))
+    return Result(parsed.score, ms, details.get("reasoning_tokens"), usage.get("completion_tokens"),
+                  cached_tokens=cached)
 
 
 def report(rows: list[Row], variants: list[dict]) -> None:
@@ -147,10 +154,12 @@ def report(rows: list[Row], variants: list[dict]) -> None:
                     if r.score is not None and (r.score >= 60) != (row.stored_score >= 60))
         ms = sum(r.ms for r in scored) / len(scored)
         reasoning = [r.reasoning_tokens for r in scored if r.reasoning_tokens is not None]
+        cached = [r.cached_tokens for r in scored if r.cached_tokens is not None]
         print(f"{label}: mean |delta| {sum(deltas) / len(deltas):.1f} pts, "
               f"max {max(deltas)} pts, {flips}/{len(scored)} crossed the 60 threshold, "
               f"{ms:.0f} ms avg" + (f", {sum(reasoning) / len(reasoning):.0f} reasoning tokens avg"
-                                    if reasoning else ", no reasoning tokens reported"))
+                                    if reasoning else ", no reasoning tokens reported")
+              + (f", {sum(cached) / len(cached):.0f} cached prompt tokens avg" if cached else ""))
     print("\nA variant whose numbers are no better than the '{} (repeat)' row changed nothing;"
           "\nthat row is this endpoint's own run-to-run noise.")
 

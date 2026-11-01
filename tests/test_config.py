@@ -76,3 +76,18 @@ def test_bullet_cap_must_be_positive(bad):
 def test_bullet_cap_defaults_to_four():
     s = load_settings({"LLM_BASE_URL": "http://x/v1", "LLM_SCORE_MODEL": "f", "LLM_TAILOR_MODEL": "p"})
     assert s.max_bullets_per_entry == 4
+
+
+def test_llm_concurrency_defaults_to_one_and_rejects_zero():
+    assert load_settings(LLM).llm_concurrency == 1
+    assert load_settings({**LLM, "LLM_CONCURRENCY": "3"}).llm_concurrency == 3
+    with pytest.raises(ValueError, match="LLM_CONCURRENCY"):
+        load_settings({**LLM, "LLM_CONCURRENCY": "0"})
+
+
+def test_load_settings_reads_the_build_sha_the_image_was_built_from():
+    # Baked in by the Docker build; the startup line prints it so whether a pull landed
+    # can be read off the log instead of grepping inside the container.
+    assert load_settings({**LLM, "BUILD_SHA": "4d6a4c1f00ddeadbeef"}).build_sha == "4d6a4c1"
+    assert load_settings(LLM).build_sha == "dev"
+    assert load_settings({**LLM, "BUILD_SHA": " "}).build_sha == "dev"

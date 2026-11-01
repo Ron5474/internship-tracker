@@ -716,7 +716,7 @@ def test_fail_fetch_moves_score_rows_to_deliver(session_factory, session, clock)
 
 from cv import load_cv
 from llm import LLMResult, ScoreResponse
-from worker import INVALID_STREAK_LIMIT, LLM_PAUSE_SECONDS, SCORE_BUDGET
+from worker import INVALID_STREAK_LIMIT, LLM_PAUSE_SECONDS, SCORE_BUDGET, UNAVAILABLE_PAUSE_SECONDS
 
 CV_DICT = load_cv(str(Path(__file__).parent / "fixtures" / "cv_sample.yaml")).model_dump()
 CVS = {"ron": CV_DICT, "cousin": CV_DICT, "dana": CV_DICT}
@@ -967,7 +967,7 @@ def test_score_unavailable_resume_is_measured_from_after_the_call(session_factor
     w = _worker_s(session_factory, SlowLLM(clock, 120, LLM_DOWN), clock)
     w.run_once()
     session.refresh(ev)
-    assert w.paused["llm:flash"] == T0 + timedelta(seconds=120 + LLM_PAUSE_SECONDS)
+    assert w.paused["llm:flash"] == T0 + timedelta(seconds=120 + UNAVAILABLE_PAUSE_SECONDS[0])
     assert ev.next_attempt_at == w.paused["llm:flash"]
 
 
@@ -1015,11 +1015,11 @@ def test_score_unavailable_pauses_llm_without_consuming_attempt(session_factory,
     assert w.run_once() is True         # ron: unavailable
     session.refresh(ev_ron)
     assert ev_ron.attempts == 0 and ev_ron.stage == STAGE_SCORE
-    assert w.paused["llm:flash"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
-    assert ev_ron.next_attempt_at == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+    assert w.paused["llm:flash"] == T0 + timedelta(seconds=UNAVAILABLE_PAUSE_SECONDS[0])
+    assert ev_ron.next_attempt_at == T0 + timedelta(seconds=UNAVAILABLE_PAUSE_SECONDS[0])
     assert w.run_once() is False        # cousin waits too; nothing deliverable
     assert len(llm.calls) == 1
-    clock.advance(LLM_PAUSE_SECONDS)
+    clock.advance(UNAVAILABLE_PAUSE_SECONDS[0])
     assert w.run_once() is True         # scoring resumes
     assert len(llm.calls) == 2
 
@@ -1094,10 +1094,12 @@ def test_score_without_llm_configured_is_skipped(session_factory, session, clock
 def test_unavailable_score_does_not_pause_the_tailor_model(session_factory, session, clock, tmp_path):
     _seed_scoreable(session, "ron")
     _seed_tailorable(session, "cousin")
-    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), FakeTailor(), clock, tmp_path)
-    w.run_once()
+    tailor = FakeTailor()
+    w = _worker_st(session_factory, FakeLLM(LLM_DOWN), tailor, clock, tmp_path)
+    while w.run_once():
+        pass
     assert w.is_paused("llm:flash") is True and w.is_paused("llm:pro") is False
-    assert w.run_once() is True          # the tailor row still moves
+    assert len(tailor.calls) == 1        # the tailor row still moved
 
 
 # --- tailor ------------------------------------------------------------------
@@ -1246,8 +1248,8 @@ def test_unavailable_tailor_consumes_the_lease(session_factory, session, clock, 
     w.run_once()
     session.refresh(ev)
     assert ev.attempts == 1 and ev.stage == STAGE_TAILOR
-    assert ev.next_attempt_at == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
-    assert w.paused["llm:pro"] == T0 + timedelta(seconds=LLM_PAUSE_SECONDS)
+    assert ev.next_attempt_at == T0 + timedelta(seconds=UNAVAILABLE_PAUSE_SECONDS[0])
+    assert w.paused["llm:pro"] == T0 + timedelta(seconds=UNAVAILABLE_PAUSE_SECONDS[0])
 
 
 def test_persistently_unavailable_tailor_degrades_to_delivered_score(session_factory, session, clock, tmp_path):
@@ -1558,14 +1560,15 @@ def test_render_runs_before_score(session_factory, session, clock, tmp_path):
     assert len(renderer.calls) == 1 and len(llm.calls) == 0
 
 
-def test_score_runs_before_tailor(session_factory, session, clock, tmp_path):
-    # The cheap model's queue drains before the expensive one's.
+def test_tailor_runs_before_score(session_factory, session, clock, tmp_path):
+    # A match that is one call from its resume finishes before another posting is started:
+    # with scoring first, the first match of a batch waited for the whole batch to be scored.
     _seed_scoreable(session, "ron")
     _seed_tailorable(session, "cousin")
     llm, tailor = FakeLLM(_llm_ok()), FakeTailor()
     w = _worker_st(session_factory, llm, tailor, clock, tmp_path)
     w.run_once()
-    assert len(llm.calls) == 1 and tailor.calls == []
+    assert len(tailor.calls) == 1 and llm.calls == []
 
 
 # --- startup: draining rows a tailorless process cannot run -----------------
@@ -1697,3 +1700,44 @@ def test_a_renderer_that_did_not_fit_leaves_the_selection_alone(session_factory,
     _worker_r(session_factory, FakeRenderer(1), clock, tmp_path).run_once()
     session.refresh(ev)
     assert ev.tailored == before
+
+
+# --- unavailable pause escalates -------------------------------------------------
+
+
+def test_unavailable_pause_starts_short_and_escalates_on_repeats(session_factory, session, clock):
+    # A LiteLLM restart is a few seconds; a flat 15-minute pause for one refused connection
+    # stalled the pipeline for the rest of the quarter hour. Only a repeat earns the long one.
+    _seed_scoreable(session, "ron")
+    w = _worker_s(session_factory, FakeLLM(LLM_DOWN, LLM_DOWN, LLM_DOWN, LLM_DOWN), clock)
+    assert UNAVAILABLE_PAUSE_SECONDS == (60, 300, 900)
+    for expected in (60, 300, 900, 900):
+        assert w.run_once() is True
+        assert w.paused["llm:flash"] == clock() + timedelta(seconds=expected)
+        clock.advance(expected)
+
+
+def test_unavailable_streak_resets_once_the_model_answers(session_factory, session, clock):
+    _seed_scoreable(session, "ron")
+    _seed_scoreable(session, "cousin")
+    llm = FakeLLM(LLM_DOWN, LLM_DOWN, _llm_ok(), LLM_DOWN)
+    w = _worker_s(session_factory, llm, clock)
+    for expected in (60, 300):
+        w.run_once()
+        clock.advance(expected)
+    assert w.run_once() is True                       # one row scored; the endpoint is back
+    while len(llm.calls) < 4:                         # (its delivery goes first) then the other row
+        assert w.run_once() is True
+    assert w.paused["llm:flash"] == clock() + timedelta(seconds=60)   # a fresh blip, not step 3
+
+
+def test_tailor_unavailable_pause_escalates_on_its_own_alias(session_factory, session, clock, tmp_path):
+    for uid in ("ron", "cousin"):
+        _seed_tailorable(session, uid)
+    down = LLMResult("unavailable", None, "HTTP 404: no such model", None, None, None, 5)
+    w = _worker_t(session_factory, FakeTailor(down, down), clock, tmp_path, users=(RON, COUSIN))
+    w.run_once()
+    assert w.paused["llm:pro"] == clock() + timedelta(seconds=60)
+    clock.advance(60)
+    w.run_once()
+    assert w.paused["llm:pro"] == clock() + timedelta(seconds=300)
