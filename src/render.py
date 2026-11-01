@@ -1,5 +1,6 @@
+import copy
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -20,6 +21,10 @@ _env = Environment(
 # Below this share of the page, a one-page resume has enough white space that another
 # project or a few more bullets would be a better use of it.
 UNDERFILL_BELOW = 0.85
+# fit_to_page keeps adding content until the page is at least this full.
+FILL_TARGET = 0.90
+# A render is ~100ms; this bounds the fit loop at a few seconds in the worst case.
+MAX_FIT_RENDERS = 25
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,7 @@ class RenderResult:
     path: str
     pages: int
     fill: float = 1.0          # share of the last page the content occupies, 0-1
+    selection: dict | None = None   # what was rendered, when a fit changed it
 
     @property
     def overflow(self) -> bool:
@@ -148,6 +154,102 @@ def build_context(cv: MasterCV, selection: dict) -> dict:
 
 def build_html(cv: MasterCV, selection: dict) -> str:
     return _env.get_template("resume.html").render(**build_context(cv, selection))
+
+
+def fit_to_page(cv: MasterCV, selection: dict, out_path: str, render=None,
+                target: float = FILL_TARGET) -> RenderResult:
+    """Render, measure, adjust, re-render until the resume is one full page.
+
+    A fixed cap on entries and bullets cannot do this: bullets run from one line to three
+    and project names from two words to a whole line, so the same count lands anywhere
+    from three-quarters of a page to a page and a quarter. The page is measured instead.
+
+    Over one page, the least relevant bullet goes first — the model's ordering is its
+    relevance ranking, and projects give way before experience. Under the target, the
+    candidate's own unselected bullets come back, deepening what is already shown before
+    adding anything new, and any addition that would spill onto a second page is skipped
+    in favour of a shorter one. Fonts and margins never change; content does.
+
+    Returns the final render with `selection` set to what was actually rendered, so the
+    caller can store it and a later re-render reproduces this exact page.
+    """
+    render = render or render_pdf
+    sel = copy.deepcopy(selection)
+    result = render(cv, sel, out_path)
+    renders, on_disk_is_sel = 1, True
+
+    while result.overflow and renders < MAX_FIT_RENDERS and _trim_one(sel):
+        result = render(cv, sel, out_path)
+        renders += 1
+
+    rejected: set[tuple] = set()
+    while not result.overflow and result.fill < target and renders < MAX_FIT_RENDERS:
+        candidate = next((c for c in _fill_candidates(cv, sel) if c not in rejected), None)
+        if candidate is None:
+            break
+        trial = _with_addition(sel, *candidate)
+        attempt = render(cv, trial, out_path)
+        renders += 1
+        if attempt.overflow:
+            rejected.add(candidate)          # too long; something shorter may still fit
+            on_disk_is_sel = False
+            continue
+        sel, result, on_disk_is_sel = trial, attempt, True
+
+    if not on_disk_is_sel:
+        # The last render was a rejected trial; the file must hold what we return.
+        result = render(cv, sel, out_path)
+    return replace(result, selection=sel)
+
+
+def _trim_one(sel: dict) -> bool:
+    """Drop the least relevant bullet, or its whole entry once it is down to one.
+
+    Projects go before experience, and within a section the last entry first. The last
+    remaining experience entry is never dropped. Returns False when nothing can go.
+    """
+    for section in ("projects", "experience"):
+        entries = sel.get(section) or []
+        if not entries:
+            continue
+        last = entries[-1]
+        if len(last["bullets"]) > 1:
+            last["bullets"].pop()
+            return True
+        if section == "experience" and len(entries) == 1:
+            return False
+        entries.pop()
+        return True
+    return False
+
+
+def _fill_candidates(cv: MasterCV, sel: dict) -> list[tuple[str, str, str]]:
+    """What could be added, best first: more of what is already on the page, then entries
+    that are not, each in the master's order."""
+    masters = {"experience": cv.experience, "projects": cv.projects}
+    out = []
+    for section in ("experience", "projects"):
+        by_id = {e.id: e for e in masters[section]}
+        for item in sel.get(section) or []:
+            entry = by_id.get(item["id"])
+            if entry is not None:
+                out += [(section, entry.id, b.id) for b in entry.bullets if b.id not in item["bullets"]]
+    for section in ("experience", "projects"):
+        shown = {item["id"] for item in sel.get(section) or []}
+        out += [(section, e.id, e.bullets[0].id) for e in masters[section]
+                if e.id not in shown and e.bullets]
+    return out
+
+
+def _with_addition(sel: dict, section: str, entry_id: str, bullet_id: str) -> dict:
+    trial = copy.deepcopy(sel)
+    entries = trial.setdefault(section, [])
+    for item in entries:
+        if item["id"] == entry_id:
+            item["bullets"].append(bullet_id)
+            return trial
+    entries.append({"id": entry_id, "bullets": [bullet_id]})
+    return trial
 
 
 def render_pdf(cv: MasterCV, selection: dict, out_path: str) -> RenderResult:

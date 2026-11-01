@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1735,3 +1736,28 @@ def test_a_rescored_match_below_the_cutoff_drops_the_previous_resume(session_fac
     session.refresh(ev)
     assert ev.stage == STAGE_DELIVER
     assert ev.pdf_path is None and ev.tailored is None and ev.page_overflow is False
+
+
+def test_render_stores_the_fitted_selection(session_factory, session, clock, tmp_path):
+    """What was rendered is what gets stored, so a re-render reproduces the same page."""
+    from render import RenderResult
+    ev = _seed_renderable(session)
+    fitted = {"experience": [{"id": "exp1", "bullets": ["exp1.b1"]}], "projects": [], "skills": {}}
+
+    def renderer(cv, selection, out_path):
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(out_path).write_bytes(b"%PDF stub")
+        return RenderResult(out_path, 1, 0.93, fitted)
+
+    _worker_r(session_factory, renderer, clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.tailored == fitted
+    assert ev.page_fill == 93
+
+
+def test_a_renderer_that_did_not_fit_leaves_the_selection_alone(session_factory, session, clock, tmp_path):
+    ev = _seed_renderable(session)
+    before = copy.deepcopy(ev.tailored)
+    _worker_r(session_factory, FakeRenderer(1), clock, tmp_path).run_once()
+    session.refresh(ev)
+    assert ev.tailored == before
