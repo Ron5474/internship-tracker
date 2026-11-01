@@ -224,20 +224,36 @@ def _trim_one(sel: dict) -> bool:
 
 
 def _fill_candidates(cv: MasterCV, sel: dict) -> list[tuple[str, str, str]]:
-    """What could be added, best first: more of what is already on the page, then entries
-    that are not, each in the master's order."""
+    """What could be added, best first.
+
+    The model's spares come first, in its order — what it ranked just past the cut is the
+    most relevant thing not on the page. Only once those run out does the master's order
+    take over: more of what is already shown, then entries that are not.
+    """
     masters = {"experience": cv.experience, "projects": cv.projects}
+    bullets = {section: {e.id: {b.id for b in e.bullets} for e in entries}
+               for section, entries in masters.items()}
+    shown = {(section, item["id"], b) for section in masters
+             for item in sel.get(section) or [] for b in item["bullets"]}
     out = []
+    for row in sel.get("reserve") or []:
+        candidate = tuple(row)
+        if len(candidate) != 3 or candidate in shown or candidate in out:
+            continue
+        section, entry_id, bullet_id = candidate
+        if bullet_id in bullets.get(section, {}).get(entry_id, ()):   # the snapshot is user data
+            out.append(candidate)
     for section in ("experience", "projects"):
         by_id = {e.id: e for e in masters[section]}
         for item in sel.get(section) or []:
             entry = by_id.get(item["id"])
             if entry is not None:
-                out += [(section, entry.id, b.id) for b in entry.bullets if b.id not in item["bullets"]]
+                out += [(section, entry.id, b.id) for b in entry.bullets
+                        if b.id not in item["bullets"] and (section, entry.id, b.id) not in out]
     for section in ("experience", "projects"):
-        shown = {item["id"] for item in sel.get(section) or []}
+        shown_ids = {item["id"] for item in sel.get(section) or []}
         out += [(section, e.id, e.bullets[0].id) for e in masters[section]
-                if e.id not in shown and e.bullets]
+                if e.id not in shown_ids and e.bullets and (section, e.id, e.bullets[0].id) not in out]
     return out
 
 

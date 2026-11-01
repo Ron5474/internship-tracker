@@ -279,3 +279,53 @@ def test_extra_key_in_cv_yaml_is_rejected():
     raw["favourite_colour"] = "blue"
     with pytest.raises(Exception):
         MasterCV.model_validate(raw)
+
+
+# --- reserve: what the model ranked past the cut ----------------------------------------
+
+
+def test_bullets_past_the_cap_become_reserve_in_the_models_order():
+    cv = _cv()
+    fat = next(p for p in cv.projects if len(p.bullets) == 4)
+    ids = [b.id for b in fat.bullets][::-1]          # the model's ranking, not the master's
+    sel, _ = validate_selection(cv, {"experience": [], "projects": [{"id": fat.id, "bullets": ids}],
+                                     "skills": {}}, max_bullets=2)
+    assert sel["projects"][0]["bullets"] == ids[:2]
+    assert [r for r in sel["reserve"] if r[1] == fat.id] == [["projects", fat.id, ids[2]],
+                                                            ["projects", fat.id, ids[3]]]
+
+
+def test_entries_past_the_cap_become_reserve():
+    cv = _cv()
+    assert len(cv.projects) == MAX_PROJECT_ENTRIES + 1
+    sel, _ = validate_selection(cv, {
+        "experience": [],
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in cv.projects],
+        "skills": {}}, max_bullets=4)
+    spare = cv.projects[-1]
+    assert [p["id"] for p in sel["projects"]] == [p.id for p in cv.projects[:MAX_PROJECT_ENTRIES]]
+    assert sel["reserve"] == [["projects", spare.id, b.id] for b in spare.bullets]
+
+
+def test_reserve_deepens_shown_entries_before_adding_new_ones():
+    cv = _cv()
+    exp = cv.experience[0]
+    sel, _ = validate_selection(cv, {
+        "experience": [{"id": exp.id, "bullets": [b.id for b in exp.bullets]}],
+        "projects": [{"id": p.id, "bullets": [b.id for b in p.bullets]} for p in cv.projects],
+        "skills": {}}, max_bullets=2)
+    new_project = cv.projects[-1]
+    assert sel["reserve"][0] == ["experience", exp.id, exp.bullets[2].id]
+    assert sel["reserve"][-1] == ["projects", new_project.id, new_project.bullets[-1].id]
+    # Spare bullets of shown projects come between the two.
+    shown_spares = [r for r in sel["reserve"] if r[0] == "projects" and r[1] != new_project.id]
+    assert shown_spares and all(r[1] in {p["id"] for p in sel["projects"]} for r in shown_spares)
+
+
+def test_reserve_is_empty_when_nothing_was_ranked_past_the_cut():
+    cv = _cv()
+    sel, _ = validate_selection(cv, {
+        "experience": [{"id": e.id, "bullets": [e.bullets[0].id]} for e in cv.experience[:2]],
+        "projects": [{"id": p.id, "bullets": [p.bullets[0].id]} for p in cv.projects[:2]],
+        "skills": {}}, max_bullets=2)
+    assert sel["reserve"] == []

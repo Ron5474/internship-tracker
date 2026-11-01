@@ -1,5 +1,20 @@
 # Operations notes
 
+## Deploying a merge
+
+Docker Hub gets the image a minute or two after the merge lands on `main` — check the
+Actions tab is green first; a `docker compose pull` run before that quietly keeps the old
+image. Then, on the server:
+
+```bash
+cd ~/deployed-projects/internship-tracker
+docker compose pull && docker compose up -d       # pull alone does not restart
+docker compose logs --since 1m | grep "Tracker starting"
+```
+
+The line reads `Tracker starting (build <sha>)`; the sha is the merge commit's first seven
+characters, which `git log --oneline -1 origin/main` shows. `build dev` means a local build.
+
 ## Fetch success by host (last 7 days)
 
 Run on the server: `sqlite3 data/tracker.db` then
@@ -71,7 +86,7 @@ Expect `200`, and the model alias in `LLM_SCORE_MODEL` must appear in that `/mod
 | --- | --- |
 | `outcome=matched` / `outcome=below_threshold` | healthy |
 | `outcome=invalid` on every row | the model is not honouring the strict schema — read `error=` for the failing field |
-| `outcome=unavailable` and `Pausing llm` every 15 min | URL, key or model alias is wrong; fix `.env` and restart rather than waiting |
+| `outcome=unavailable` and `Pausing llm` repeating (1 min, then 5, then every 15) | URL, key or model alias is wrong; fix `.env` and restart rather than waiting. A single one that does not repeat was a blip (LiteLLM restarting) and clears itself |
 | `Pausing llm (3 consecutive invalid replies…)` | the breaker: three invalid replies in a row, same cause as above |
 | `outcome=unusable` | the model says the fetched text is not a posting; the row is delivered link-only |
 
@@ -130,17 +145,35 @@ SELECT (score / 5) * 5 AS band, COUNT(*) AS matches,
 FROM evaluations WHERE outcome = 'matched' GROUP BY 1 ORDER BY 1 DESC;
 ```
 
-## Deploying Jev scoring
+### Calls in flight
 
-The old image cannot score with a Jev alias (it calls `/chat/completions`), and the new image cannot score with a chat alias (it calls `/decisions`). Switch the config and the image together:
+Scoring is serial unless `.env` sets `LLM_CONCURRENCY` (default 1). Each call takes about as
+long as the model's reasoning, so a batch of ten postings is ten calls end to end; with
+`LLM_CONCURRENCY=3` it is three or four rounds. The startup line reports it:
+`Scoring with … N call(s) in flight`.
 
-1. Leave `notify_below_threshold: true` on while Jev's scale settles — its 0–100 is not flash's, so the old `threshold` is a starting point, not a calibrated value.
-2. In `~/deployed-projects/internship-tracker/.env`, set `LLM_API_KEY` to the new key (it covers both Jev and `deepseek-v4-pro`) and `LLM_SCORE_MODEL` to the Jev alias.
-3. Straight after, `docker compose pull && docker compose up -d`.
-4. Watch for the first lines: `docker compose logs -f internship-tracker | grep -E "score ev=|Pausing|ERROR"`. Expect `outcome=matched`/`below_threshold` with `tech=… fit=…` on the end. `outcome=invalid` with `HTTP 400` means LiteLLM rejected the request — read `error=`; an input-length complaint would mean the posting plus CV exceeds Jev's limit.
-5. After a week, set `threshold` from what the 🎯/📉 split looked like, then raise `tailor_threshold` to where you stop downloading the resume.
+With Jev scoring, a score call takes a fraction of a second, so this mostly matters for the
+tailor calls on `LLM_TAILOR_MODEL`. The `ab_score.py` check below times the chat scoring path,
+so treat it as a rough read on the endpoint, not a measure of Jev.
 
-Rolling back to a pre-Jev image needs `LLM_SCORE_MODEL` back on a chat alias (`deepseek-v4-flash`). `tailor_threshold` would then make the old image refuse to start (`extra="forbid"`), so remove it from `users.yaml` too.
+Before raising it, check the endpoint actually serves parallel requests at full speed —
+LiteLLM and the provider both have their own limits. Run a few calls alone, then the same
+calls at once, from inside the container:
+
+```bash
+# one at a time
+docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 3 --variant '{}'
+# three at once (three shells, or `&` them); compare the "ms avg" figures
+for i in 1 2 3; do docker compose exec -T internship-tracker python3 /app/scripts/ab_score.py --limit 1 --variant '{}' & done; wait
+```
+
+If the parallel runs take about as long each as a lone one, the endpoint keeps up and
+`LLM_CONCURRENCY=3` is safe; if they take three times longer, it is queueing them and the
+setting buys nothing. Then set it in `.env` and `docker compose up -d`.
+
+Rows with a call in flight look leased in the database (`attempts` bumped, `next_attempt_at`
+30 s out) exactly as a serial call does; a restart mid-call loses the reply and retries the row
+after its backoff, as before.
 
 ### Calibration week
 
@@ -187,6 +220,18 @@ do not. Guarded by `tests/test_prompts.py`.
 
 Watch the next batch for the opposite error — a real data or ML posting pushed under 40 by the
 gate. If that happens the category list is too broad, not the ceiling.
+
+## Deploying Jev scoring
+
+The old image cannot score with a Jev alias (it calls `/chat/completions`), and the new image cannot score with a chat alias (it calls `/decisions`). Switch the config and the image together:
+
+1. Leave `notify_below_threshold: true` on while Jev's scale settles — its 0–100 is not flash's, so the old `threshold` is a starting point, not a calibrated value.
+2. In `~/deployed-projects/internship-tracker/.env`, set `LLM_API_KEY` to the new key (it covers both Jev and `deepseek-v4-pro`) and `LLM_SCORE_MODEL` to the Jev alias.
+3. Straight after, `docker compose pull && docker compose up -d`.
+4. Watch for the first lines: `docker compose logs -f internship-tracker | grep -E "score ev=|Pausing|ERROR"`. Expect `outcome=matched`/`below_threshold` with `tech=… fit=…` on the end. `outcome=invalid` with `HTTP 400` means LiteLLM rejected the request — read `error=`; an input-length complaint would mean the posting plus CV exceeds Jev's limit.
+5. After a week, set `threshold` from what the 🎯/📉 split looked like, then raise `tailor_threshold` to where you stop downloading the resume.
+
+Rolling back to a pre-Jev image needs `LLM_SCORE_MODEL` back on a chat alias (`deepseek-v4-flash`). `tailor_threshold` would then make the old image refuse to start (`extra="forbid"`), so remove it from `users.yaml` too.
 
 ## Deploying Plan 4
 

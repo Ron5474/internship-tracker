@@ -7,7 +7,7 @@ are matches. A careless edit that drops the gate produces no test failure anywhe
 the damage only shows up days later as noise in Discord.
 """
 
-from prompts import SCORE_SYSTEM, reask_message, score_user_message
+from prompts import SCORE_SYSTEM, reask_message, score_user_message, tailor_user_message
 
 
 def test_score_prompt_asks_for_the_discipline_decision_first():
@@ -54,3 +54,17 @@ def test_jev_tech_question_names_the_disciplines_that_misfired():
 def test_jev_fit_levels_run_lowest_first_in_five_steps():
     from prompts import DECISION_FIT_LEVELS
     assert [lvl["label"] for lvl in DECISION_FIT_LEVELS] == ["poor", "weak", "partial", "good", "strong"]
+
+
+def test_tailor_user_message_puts_the_cv_before_the_posting():
+    msg = tailor_user_message("JD TEXT", "CV TEXT", 4)
+    assert msg.index("CV TEXT") < msg.index("JD TEXT")
+    assert "first 4 bullets" in msg and "spare" in msg
+
+
+def test_tailor_prompt_asks_for_spares_past_the_cut():
+    from prompts import TAILOR_SYSTEM
+    flat = " ".join(TAILOR_SYSTEM.split())
+    assert "spare" in flat
+    assert "every bullet worth showing" in flat
+    assert "every project with some relevance" in flat
