@@ -33,6 +33,9 @@ class User(BaseModel):
     # A match at or above this gets a tailored resume (a call to the pricier tailor model); a
     # match between `threshold` and this is delivered without one. Unset means `threshold`.
     tailor_threshold: int | None = None
+    # Feeds whose matches get a tailored resume. Matches from any other feed are still scored and
+    # delivered, without one. Unset means every feed the user follows; [] means no resumes at all.
+    tailor_feeds: list[str] | None = None
     # min_length=1 so `discord_webhook_private: ""` fails validation instead of passing as a
     # falsy-but-present string that `results_webhook` would then silently route to the public URL.
     discord_webhook_private: str | None = Field(default=None, min_length=1)
@@ -57,6 +60,17 @@ class User(BaseModel):
         elif self.tailor_threshold < self.threshold:
             raise ValueError(f"tailor_threshold ({self.tailor_threshold}) must be at least "
                              f"threshold ({self.threshold})")
+        return self
+
+    @model_validator(mode="after")
+    def _tailor_feeds_are_followed(self) -> "User":
+        if self.tailor_feeds is None:
+            self.tailor_feeds = list(self.feeds)
+            return self
+        # A typo here would silently switch resumes off for the feed that was meant.
+        stray = [f for f in self.tailor_feeds if f not in self.feeds]
+        if stray:
+            raise ValueError(f"tailor_feeds names feed(s) not in feeds: {', '.join(stray)}")
         return self
 
     @model_validator(mode="after")

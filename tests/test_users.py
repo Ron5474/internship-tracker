@@ -236,3 +236,29 @@ def test_tailor_threshold_below_threshold_is_rejected():
     # Every match below it would skip the resume anyway, so a lower value can only be a typo.
     with pytest.raises(ValidationError, match="tailor_threshold"):
         _tt_user(threshold=60, tailor_threshold=50)
+
+
+# --- tailor_feeds --------------------------------------------------------------
+
+def _tf_user(**kw):
+    base = dict(id="ron", cv="/x", discord_webhook="https://d/ron", feeds=["internships", "new-grad"],
+                sections=["software"])
+    return User(**{**base, **kw})
+
+
+def test_tailor_feeds_defaults_to_every_subscribed_feed():
+    assert _tf_user().tailor_feeds == ["internships", "new-grad"]
+
+
+def test_tailor_feeds_can_name_a_subset():
+    assert _tf_user(tailor_feeds=["new-grad"]).tailor_feeds == ["new-grad"]
+
+
+def test_an_empty_tailor_feeds_means_no_resumes():
+    assert _tf_user(tailor_feeds=[]).tailor_feeds == []
+
+
+def test_tailor_feeds_outside_the_users_feeds_is_rejected():
+    # A typo here would silently switch resumes off for the feed the user meant.
+    with pytest.raises(ValidationError, match="tailor_feeds"):
+        _tf_user(feeds=["internships"], tailor_feeds=["new-grad"])
