@@ -72,7 +72,16 @@ def _below_cutoff(ev: Evaluation, tailor_threshold: int | None) -> bool:
             and ev.resume_error is None and ev.score is not None and ev.score < tailor_threshold)
 
 
-def message_for(ev: Evaluation, tailor_threshold: int | None = None) -> str:
+def _resumes_off_for(ev: Evaluation, tailor_feeds: list[str] | None) -> str | None:
+    """The feed name, when this match had no resume because its feed is not in tailor_feeds."""
+    if tailor_feeds is None or ev.outcome != "matched" or ev.pdf_path is not None or ev.resume_error is not None:
+        return None
+    feed = ev.job.feed.name
+    return None if feed in tailor_feeds else feed
+
+
+def message_for(ev: Evaluation, tailor_threshold: int | None = None,
+                tailor_feeds: list[str] | None = None) -> str:
     job = ev.job
     if ev.score is not None and ev.outcome in ("matched", "below_threshold"):
         return format_match(
@@ -86,6 +95,7 @@ def message_for(ev: Evaluation, tailor_threshold: int | None = None) -> str:
             resume_missing=ev.outcome == "matched" and ev.pdf_path is None and ev.resume_error is not None,
             underfill=_underfill(ev),
             below_cutoff=_below_cutoff(ev, tailor_threshold),
+            resumes_off_for=_resumes_off_for(ev, tailor_feeds),
         )
     return format_link_only(job.company, job.role, job.location, job.url, note=_LINK_ONLY_NOTES.get(ev.outcome))
 
@@ -575,9 +585,10 @@ class Worker:
             ev.last_error = None
             if data.score >= user.threshold:
                 ev.outcome = "matched"
-                # Under the resume cutoff the match is still delivered, just without the pricier
-                # tailor call; message_for() says why there is no PDF.
-                tailor = self._tailoring_enabled and data.score >= user.tailor_threshold
+                # Under the resume cutoff, or from a feed not in tailor_feeds, the match is still
+                # delivered, just without the pricier tailor call; message_for() says why.
+                tailor = (self._tailoring_enabled and data.score >= user.tailor_threshold
+                          and ev.job.feed.name in user.tailor_feeds)
                 if self._tailoring_enabled and not tailor:
                     # Same as below_threshold: a re-scored row must not ship a previous run's PDF.
                     ev.tailored, ev.pdf_path, ev.page_overflow, ev.resume_error = None, None, False, None
@@ -825,7 +836,7 @@ class Worker:
             pdf_path = None
 
         try:
-            result = self._send(user.results_webhook, message_for(ev, user.tailor_threshold), pdf_path,
+            result = self._send(user.results_webhook, message_for(ev, user.tailor_threshold, user.tailor_feeds), pdf_path,
                                 self._attachment_name(ev) if pdf_path else None)
         except Exception as e:  # noqa: BLE001 — anything the sender raises is a failed attempt, not a crash
             log.exception("Sender raised for evaluation %d", ev.id)

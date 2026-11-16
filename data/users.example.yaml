@@ -7,6 +7,9 @@
   # Optional. Matches scoring at or above this get a tailored resume; matches between
   # `threshold` and this are still delivered, without one. Defaults to `threshold`.
   # tailor_threshold: 75
+  # Optional. Only matches from these feeds get a tailored resume; matches from the others are
+  # still scored and delivered, without one. Defaults to every feed above; [] means no resumes.
+  # tailor_feeds: [new-grad]
   # Calibration: true delivers below-threshold postings too, with their score, so you can
   # judge the scoring. Set false once you trust it.
   notify_below_threshold: false

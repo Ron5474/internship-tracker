@@ -136,7 +136,9 @@ FROM evaluations WHERE score_usage IS NOT NULL GROUP BY 1;
 
 `tailor_threshold` (per user, in `users.yaml`) decides which matches get a tailored resume from `LLM_TAILOR_MODEL`. A match at or above it is tailored and rendered as before. A match between `threshold` and `tailor_threshold` is still delivered as 🎯, with "📄 No resume — below your resume cutoff" and no pro call. Unset, it equals `threshold`, so every match is tailored. It must not be below `threshold`; loading `users.yaml` fails if it is.
 
-The cutoff is read at scoring time: changing it affects rows scored afterwards, not ones already queued for tailoring.
+`tailor_feeds` narrows it by feed: `tailor_feeds: [new-grad]` keeps resumes for full-time roles only. Internship matches are still scored and delivered as 🎯, with "📄 No resume — resumes are off for internships" (that note wins when a match is also below the cutoff). Unset, it is every feed the user follows; `[]` means no resumes at all. Naming a feed the user does not follow fails at load, so a typo cannot quietly switch resumes off.
+
+Both are read at scoring time: changing them affects rows scored afterwards, not ones already queued for tailoring.
 
 ```sql
 -- matches by score band, to pick a cutoff

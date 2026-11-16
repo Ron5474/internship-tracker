@@ -1805,3 +1805,72 @@ def test_tailor_unavailable_pause_escalates_on_its_own_alias(session_factory, se
     clock.advance(60)
     w.run_once()
     assert w.paused["llm:pro"] == clock() + timedelta(seconds=300)
+
+
+# --- tailor_feeds ------------------------------------------------------------------
+
+RON_FULLTIME_RESUMES = User(id="ron", cv="/x", discord_webhook="https://d/ron",
+                            feeds=["internships", "new-grad"], sections=["software"],
+                            tailor_feeds=["new-grad"])
+
+
+def _on_new_grad(session, ev):
+    feed = session.query(Feed).filter_by(name="new-grad").first() or Feed(name="new-grad", repo="c/d", branch="dev")
+    ev.job.feed = feed
+    session.commit()
+    return ev
+
+
+def test_an_internship_match_skips_tailoring_when_only_new_grad_gets_resumes(session_factory, session, clock, tmp_path):
+    ev = _seed_scoreable(session, "ron")                     # internships feed
+    tailor = FakeTailor()
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(90)), tailor, clock, tmp_path, users=(RON_FULLTIME_RESUMES,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.outcome == "matched" and ev.stage == STAGE_DELIVER
+    assert tailor.calls == []
+
+
+def test_a_new_grad_match_is_tailored(session_factory, session, clock, tmp_path):
+    ev = _on_new_grad(session, _seed_scoreable(session, "ron"))
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(90)), FakeTailor(), clock, tmp_path, users=(RON_FULLTIME_RESUMES,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_TAILOR
+
+
+def test_message_for_a_match_in_a_feed_without_resumes_names_the_feed(session_factory, session):
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=90, outcome="matched")
+    msg = message_for(ev, tailor_threshold=60, tailor_feeds=["new-grad"])
+    assert msg.startswith("🎯 90%")
+    assert "resumes are off for internships" in msg
+    assert "resume cutoff" not in msg and "Couldn't generate resume" not in msg
+
+
+def test_message_for_a_match_in_a_feed_with_resumes_has_no_feed_note(session_factory, session):
+    ev = _on_new_grad(session, _seed(session, "ron", stage=STAGE_DELIVER, score=90, outcome="matched",
+                                     pdf_path="/x/r.pdf"))
+    assert "resumes are off" not in message_for(ev, tailor_threshold=60, tailor_feeds=["new-grad"])
+
+
+def test_the_feed_note_wins_over_the_cutoff_note(session_factory, session):
+    # Below the cutoff AND in a feed without resumes: the feed is the reason that will not change.
+    ev = _seed(session, "ron", stage=STAGE_DELIVER, score=65, outcome="matched")
+    msg = message_for(ev, tailor_threshold=75, tailor_feeds=["new-grad"])
+    assert "resumes are off for internships" in msg and "resume cutoff" not in msg
+
+
+def test_delivery_of_an_internship_match_carries_the_feed_note(session_factory, session, clock):
+    _resolve(session, _seed(session, "ron", stage=STAGE_DELIVER, score=90, outcome="matched"))
+    sender = FakeSender()
+    _worker(session_factory, sender, clock, users=(RON_FULLTIME_RESUMES,)).run_once()
+    assert "resumes are off for internships" in sender.calls[0][1]
+
+
+def test_a_rescored_internship_match_drops_the_previous_resume(session_factory, session, clock, tmp_path):
+    ev = _seed_scoreable(session, "ron", tailored={"experience": []}, pdf_path="/old/r.pdf", page_overflow=True)
+    w = _worker_st(session_factory, FakeLLM(_llm_ok(90)), FakeTailor(), clock, tmp_path, users=(RON_FULLTIME_RESUMES,))
+    w.run_once()
+    session.refresh(ev)
+    assert ev.stage == STAGE_DELIVER
+    assert ev.pdf_path is None and ev.tailored is None and ev.page_overflow is False
